@@ -48,6 +48,60 @@ pid_is_ours() {
 # appeared in the file immediately after the background launch.
 # Prints the PID on success; returns 1 if the child never appears
 # (e.g. the command exited before we could observe it).
+# Return true (0) if the container's workload is still alive.
+# Checks workload_pid first (stable, lives for the full container lifetime).
+# Falls back to unshare_pid only when workload_pid is empty, which can happen
+# for commands that exit before find_workload_pid captures the child.
+container_is_running() {
+    local cdir="$1"
+    local state
+    state=$(read_meta "$cdir" state)
+    [[ "$state" == "running" ]] || return 1
+
+    local wpid wstart
+    wpid=$(read_meta "$cdir" workload_pid)
+    wstart=$(read_meta "$cdir" workload_start)
+
+    if [[ -n "$wpid" ]]; then
+        pid_is_ours "$wpid" "$wstart"
+        return
+    fi
+
+    local upid ustart
+    upid=$(read_meta "$cdir" unshare_pid)
+    ustart=$(read_meta "$cdir" unshare_start)
+    pid_is_ours "$upid" "$ustart"
+}
+
+# Resolve the live state of a container, correcting stale "running" records.
+# Prints one of: running, exited, unknown
+resolve_state() {
+    local cdir="$1"
+    local recorded
+    recorded=$(read_meta "$cdir" state)
+
+    if [[ "$recorded" == "running" ]]; then
+        if container_is_running "$cdir"; then
+            echo "running"
+        else
+            # Process is gone but state was never updated — fix it now.
+            # exited_at records when termination was detected, not when it occurred.
+            # The exit code cannot be recovered at this point.
+            write_meta "$cdir" state "exited"
+            [[ -z "$(read_meta "$cdir" exited_at)" ]] && \
+                write_meta "$cdir" exited_at "$(date +%s)"
+            echo "exited"
+        fi
+        return
+    fi
+
+    if [[ -n "$recorded" ]]; then
+        echo "$recorded"
+    else
+        echo "unknown"
+    fi
+}
+
 find_workload_pid() {
     local unshare_pid="$1"
     local children_file="/proc/${unshare_pid}/task/${unshare_pid}/children"

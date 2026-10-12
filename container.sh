@@ -1,7 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# Use the default unless a nonempty environment variable overrides it.
 ROOTFS="/var/lib/k8s-from-scratch/rootfs"
 
 if [[ -v CONTAINER_ROOTFS ]]; then
@@ -15,13 +14,20 @@ CONTAINER_STATE_DIR="/var/lib/k8s-from-scratch/containers"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/validate.sh"
 source "${SCRIPT_DIR}/lib/meta.sh"
-source "${SCRIPT_DIR}/lib/run.sh"
+source "${SCRIPT_DIR}/lib/namespace.sh"
+source "${SCRIPT_DIR}/lib/create.sh"
+source "${SCRIPT_DIR}/lib/list.sh"
+source "${SCRIPT_DIR}/lib/get.sh"
+source "${SCRIPT_DIR}/lib/delete.sh"
 
 usage() {
     echo "Usage:"
-    echo "  $0 create <name>                              # foreground /bin/bash"
-    echo "  $0 create <name> <command> [arguments...]     # foreground command"
-    echo "  $0 create -d <name> <command> [arguments...]  # background command"
+    echo "  $0 create <name>                               # foreground /bin/bash"
+    echo "  $0 create <name> <command> [arguments...]      # foreground command"
+    echo "  $0 create -d <name> <command> [arguments...]   # background command"
+    echo "  $0 list                                        # list all containers"
+    echo "  $0 get <name>                                  # show container details"
+    echo "  $0 delete <name> [name ...]                    # delete containers"
 }
 
 main() {
@@ -34,9 +40,10 @@ main() {
     shift
 
     case "$action" in
-        create)
-            create_container "$@"
-            ;;
+        create) create_container "$@" ;;
+        list)   cmd_list "$@" ;;
+        get)    cmd_get "$@" ;;
+        delete) cmd_delete "$@" ;;
         *)
             echo "Unknown command: $action" >&2
             usage

@@ -1,29 +1,5 @@
-# Container namespace runner and create command.
-# Expects ROOTFS and CONTAINER_STATE_DIR to be set by the caller (container.sh).
-# Expects validate.sh and meta.sh to be sourced before this file.
-
-# Launches the namespace-isolated workload.  Forks unshare, which in turn forks
-# a short-lived bash that sets up hostname/mounts and exec's chroot.  After exec,
-# the workload is PID 1 inside its own PID namespace.
-run_isolated() {
-    local name="$1"
-    shift
-
-    unshare --uts --pid --fork --mount -- /bin/bash -c '
-        set -euo pipefail
-
-        rootfs="$1"
-        name="$2"
-        shift 2
-
-        hostname "$name"
-
-        mount --make-rprivate /
-        mount -t proc proc "$rootfs/proc"
-
-        exec chroot "$rootfs" "$@"
-    ' container-init "$ROOTFS" "$name" "$@"
-}
+# create subcommand.
+# Expects ROOTFS, CONTAINER_STATE_DIR to be set and all lib files sourced.
 
 create_container() {
     local detach=0
@@ -45,22 +21,13 @@ create_container() {
     validate_name "$name"
     validate_rootfs
 
-    # Prevent duplicate running containers with the same name.
     local cdir
     cdir=$(container_dir "$name")
     if [[ -d "$cdir" ]]; then
-        local state
-        state=$(read_meta "$cdir" state)
-        if [[ "$state" == "running" ]]; then
-            local upid ustart
-            upid=$(read_meta "$cdir" unshare_pid)
-            ustart=$(read_meta "$cdir" unshare_start)
-            if pid_is_ours "$upid" "$ustart"; then
-                echo "Container '$name' already exists and is running." >&2
-                return 1
-            fi
+        if container_is_running "$cdir"; then
+            echo "Container '$name' already exists and is running." >&2
+            return 1
         fi
-        # Exited or stale record: remove so the name can be reused.
         rm -rf "$cdir"
     fi
 
@@ -95,17 +62,14 @@ _create_detached() {
 
     local log="${cdir}/log"
 
-    # Launch unshare in the background: stdin closed, stdout+stderr captured.
     run_isolated "$name" "$@" </dev/null >"$log" 2>&1 &
     local unshare_pid=$!
 
-    # Record the unshare PID and its start time before it can exit.
     local ustart
     ustart=$(read_pid_start "$unshare_pid")
     write_meta "$cdir" unshare_pid "$unshare_pid"
     write_meta "$cdir" unshare_start "$ustart"
 
-    # Find the workload's outer PID (the child unshare forked).
     local workload_pid=""
     if workload_pid=$(find_workload_pid "$unshare_pid"); then
         local wstart
@@ -113,23 +77,27 @@ _create_detached() {
         write_meta "$cdir" workload_pid "$workload_pid"
         write_meta "$cdir" workload_start "$wstart"
     else
-        # The command may have already exited; record empty so later
-        # commands know the field is intentionally absent.
         write_meta "$cdir" workload_pid ""
         write_meta "$cdir" workload_start ""
     fi
 
-    # Detect immediate startup failures.
     if ! kill -0 "$unshare_pid" 2>/dev/null; then
         local exit_code=0
         wait "$unshare_pid" 2>/dev/null || exit_code=$?
         write_meta "$cdir" state "exited"
         write_meta "$cdir" exited_at "$(date +%s)"
         write_meta "$cdir" exit_code "$exit_code"
-        echo "Container '$name' failed at startup (exit $exit_code). See: $log" >&2
-        return 1
+        if [[ $exit_code -eq 0 ]]; then
+            echo "Container '$name' ran and exited successfully."
+        else
+            echo "Container '$name' failed at startup (exit $exit_code). See: $log" >&2
+            return 1
+        fi
+        return 0
     fi
 
+    # The process exists — namespace setup may still be in progress.
+    # 'running' means the workload process is alive, not that it is fully ready.
     write_meta "$cdir" state "running"
     echo "Container '$name' started (unshare PID ${unshare_pid})."
     echo "  Log: $log"
