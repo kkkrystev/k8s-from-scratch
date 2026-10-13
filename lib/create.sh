@@ -1,5 +1,5 @@
 # create subcommand.
-# Expects ROOTFS, CONTAINER_STATE_DIR to be set and all lib files sourced.
+# Expects ROOTFS, CONTAINER_STATE_DIR, ETCD_DIR to be set and all lib files sourced.
 
 create_container() {
     local detach=0
@@ -37,6 +37,9 @@ create_container() {
             echo "Example: $0 create -d $name /bin/sleep 3600" >&2
             return 1
         fi
+        # Write the pod spec to etcd so the kubelet and other components
+        # know what this pod is supposed to be running.
+        etcd_put "containers/${name}/spec" "$(json_build_spec "$name" "$@")"
         _create_detached "$name" "$@"
     else
         if [[ $# -eq 0 ]]; then
@@ -61,6 +64,12 @@ _create_detached() {
     write_meta "$cdir" started_at "$(date +%s)"
 
     local log="${cdir}/log"
+    local started_at
+    started_at=$(read_meta "$cdir" started_at)
+
+    # Write initial status to etcd so other components see the pod immediately.
+    etcd_put "containers/${name}/status" \
+        "$(json_build_status "starting" "$started_at" null null null "$log")"
 
     run_isolated "$name" "$@" </dev/null >"$log" 2>&1 &
     local unshare_pid=$!
@@ -79,14 +88,19 @@ _create_detached() {
     else
         write_meta "$cdir" workload_pid ""
         write_meta "$cdir" workload_start ""
+        workload_pid=""
     fi
 
     if ! kill -0 "$unshare_pid" 2>/dev/null; then
         local exit_code=0
         wait "$unshare_pid" 2>/dev/null || exit_code=$?
+        local exited_at
+        exited_at=$(date +%s)
         write_meta "$cdir" state "exited"
-        write_meta "$cdir" exited_at "$(date +%s)"
+        write_meta "$cdir" exited_at "$exited_at"
         write_meta "$cdir" exit_code "$exit_code"
+        etcd_put "containers/${name}/status" \
+            "$(json_build_status "exited" "$started_at" "$exited_at" "$exit_code" "$workload_pid" "$log")"
         if [[ $exit_code -eq 0 ]]; then
             echo "Container '$name' ran and exited successfully."
         else
@@ -99,6 +113,9 @@ _create_detached() {
     # The process exists — namespace setup may still be in progress.
     # 'running' means the workload process is alive, not that it is fully ready.
     write_meta "$cdir" state "running"
-    echo "Container '$name' started (unshare PID ${unshare_pid})."
+    etcd_put "containers/${name}/status" \
+        "$(json_build_status "running" "$started_at" null null "$workload_pid" "$log")"
+
+    echo "Container '$name' started (PID ${workload_pid:-${unshare_pid}})."
     echo "  Log: $log"
 }

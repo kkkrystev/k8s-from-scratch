@@ -90,6 +90,13 @@ resolve_state() {
             write_meta "$cdir" state "exited"
             [[ -z "$(read_meta "$cdir" exited_at)" ]] && \
                 write_meta "$cdir" exited_at "$(date +%s)"
+            # Mirror the correction into etcd so other components see it.
+            local pod_name exited_at started_at
+            pod_name=$(basename "$cdir")
+            started_at=$(read_meta "$cdir" started_at)
+            exited_at=$(read_meta "$cdir" exited_at)
+            etcd_put "containers/${pod_name}/status" \
+                "$(json_build_status "exited" "$started_at" "$exited_at" null null "$(read_meta "$cdir" log)")"
             echo "exited"
         fi
         return

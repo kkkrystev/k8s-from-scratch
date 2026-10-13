@@ -10,9 +10,12 @@ if [[ -v CONTAINER_ROOTFS ]]; then
 fi
 
 CONTAINER_STATE_DIR="/var/lib/k8s-from-scratch/containers"
+ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/validate.sh"
+source "${SCRIPT_DIR}/lib/etcd-client.sh"
+source "${SCRIPT_DIR}/lib/json.sh"
 source "${SCRIPT_DIR}/lib/meta.sh"
 source "${SCRIPT_DIR}/lib/namespace.sh"
 source "${SCRIPT_DIR}/lib/create.sh"
