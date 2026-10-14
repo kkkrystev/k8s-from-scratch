@@ -1,9 +1,11 @@
-# get subcommand.
-# Expects CONTAINER_STATE_DIR, ETCD_DIR to be set and meta.sh/validate.sh/etcd-client.sh/json.sh sourced.
+# get subcommand — pure reader.
+# Reads all container state from etcd. Never writes.
+# State corrections are the kubelet's responsibility.
+# Expects ETCD_DIR to be set and etcd-client.sh/json.sh/validate.sh sourced.
 
 cmd_get() {
     if [[ $# -eq 0 ]]; then
-        echo "Missing pod name." >&2
+        echo "Missing container name." >&2
         echo "Usage: $0 get <name>" >&2
         return 1
     fi
@@ -26,21 +28,6 @@ cmd_get() {
     exit_code=$(json_get_field "$status_json" "exit_code")
     workload_pid=$(json_get_field "$status_json" "workload_pid")
     log_path=$(json_get_field "$status_json" "log")
-
-    # For running pods, do a live PID check and correct if stale.
-    if [[ "$state" == "running" ]]; then
-        local cdir
-        cdir=$(container_dir "$name")
-        if [[ -d "$cdir" ]]; then
-            state=$(resolve_state "$cdir")
-            # Re-read exited_at in case resolve_state just wrote it.
-            if [[ "$state" == "exited" ]]; then
-                exited_at=$(read_meta "$cdir" exited_at)
-            fi
-        else
-            state="unknown"
-        fi
-    fi
 
     _fmt_ts() {
         local t="$1"

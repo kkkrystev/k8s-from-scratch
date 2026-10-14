@@ -3,10 +3,8 @@ set -euo pipefail
 
 ROOTFS="/var/lib/k8s-from-scratch/rootfs"
 
-if [[ -v CONTAINER_ROOTFS ]]; then
-    if [[ -n "$CONTAINER_ROOTFS" ]]; then
-        ROOTFS="$CONTAINER_ROOTFS"
-    fi
+if [[ -v CONTAINER_ROOTFS && -n "$CONTAINER_ROOTFS" ]]; then
+    ROOTFS="$CONTAINER_ROOTFS"
 fi
 
 CONTAINER_STATE_DIR="/var/lib/k8s-from-scratch/containers"
@@ -25,12 +23,10 @@ source "${SCRIPT_DIR}/lib/delete.sh"
 
 usage() {
     echo "Usage:"
-    echo "  $0 create <name>                               # foreground /bin/bash"
-    echo "  $0 create <name> <command> [arguments...]      # foreground command"
-    echo "  $0 create -d <name> <command> [arguments...]   # background command"
-    echo "  $0 list                                        # list all containers"
-    echo "  $0 get <name>                                  # show container details"
-    echo "  $0 delete <name> [name ...]                    # delete containers"
+    echo "  $0 create <name> <command> [args...]   # declare a pod (kubelet will start it)"
+    echo "  $0 list                                # list all pods"
+    echo "  $0 get <name>                          # show pod details"
+    echo "  $0 delete <name> [name ...]            # mark pods for deletion"
 }
 
 main() {
