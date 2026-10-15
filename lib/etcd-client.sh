@@ -1,6 +1,12 @@
-# etcd client primitives.
+# Fake etcd client.
 # Expects ETCD_DIR to be set by the caller.
+#
+# In real etcd, keys like "pods/myapp/spec" are flat strings — the slashes are
+# just a naming convention, not a directory structure. Here we approximate that
+# by mapping each key to a file on disk, which means the slashes become real
+# directories. The semantics are the same; the storage is not.
 
+# Store a value at the given key.
 etcd_put() {
     local key="$1" value="$2"
     local path="${ETCD_DIR}/${key}"
@@ -11,6 +17,7 @@ etcd_put() {
     mv "$tmp" "$path"
 }
 
+# Read the value stored at the given key. Fails if the key does not exist.
 etcd_get() {
     local key="$1"
     local path="${ETCD_DIR}/${key}"
@@ -20,20 +27,20 @@ etcd_get() {
     cat "$path"
 }
 
+# Delete a key. No-op if it does not exist.
 etcd_delete() {
     local key="$1"
     local path="${ETCD_DIR}/${key}"
     rm -f "$path"
 }
 
-# Print one key per line whose path starts with the given prefix.
-# Prefix is treated as a directory name -- "containers" lists everything under etcd/containers/.
+# List all keys that start with a given prefix, one per line.
+# e.g. etcd_list "pods" returns "pods/myapp/spec", "pods/myapp/status", etc.
 etcd_list() {
     local prefix="${1:-}"
     local base="${ETCD_DIR}/${prefix}"
     [[ -d "$base" ]] || return 0
     find "$base" -type f | while read -r path; do
-        # Strip the ETCD_DIR root and leading slash to get the key.
         echo "${path#${ETCD_DIR}/}"
     done
 }

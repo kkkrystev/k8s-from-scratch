@@ -1,4 +1,3 @@
-# list subcommand — pure reader.
 # Reads all pod state from etcd. Never writes.
 # State corrections are the kubelet's responsibility.
 # Expects ETCD_DIR to be set and etcd-client.sh/json.sh sourced.

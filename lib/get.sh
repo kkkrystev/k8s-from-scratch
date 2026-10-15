@@ -21,12 +21,11 @@ cmd_get() {
         return 1
     fi
 
-    local state started_at exited_at exit_code workload_pid log_path
+    local state started_at exited_at exit_code log_path
     state=$(json_get_field "$status_json" "state")
     started_at=$(json_get_field "$status_json" "started_at")
     exited_at=$(json_get_field "$status_json" "exited_at")
     exit_code=$(json_get_field "$status_json" "exit_code")
-    workload_pid=$(json_get_field "$status_json" "workload_pid")
     log_path=$(json_get_field "$status_json" "log")
 
     _fmt_ts() {
@@ -38,11 +37,10 @@ cmd_get() {
         fi
     }
 
-    echo "Name:          $name"
-    echo "State:         $state"
-    echo "Started:       $(_fmt_ts "$started_at")"
-    [[ -n "$exited_at" && "$exited_at" != "null" ]] && echo "Exited:        $(_fmt_ts "$exited_at")"
-    [[ -n "$exit_code" && "$exit_code" != "null" ]] && echo "Exit code:     $exit_code"
-    echo "Workload PID:  ${workload_pid:-}"
-    echo "Log:           ${log_path:-}"
+    echo "Name:      $name"
+    echo "State:     $state"
+    echo "Started:   $(_fmt_ts "$started_at")"
+    [[ -n "$exited_at"  && "$exited_at"  != "null" ]] && echo "Exited:    $(_fmt_ts "$exited_at")"
+    [[ -n "$exit_code"  && "$exit_code"  != "null" ]] && echo "Exit code: $exit_code"
+    echo "Log:       ${log_path:-}"
 }

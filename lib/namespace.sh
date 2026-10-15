@@ -1,8 +1,8 @@
 run_isolated() {
-    local container_name="$1" rootfs="$2"
-    shift 2
+    local container_name="$1" ns_uts_path="$2" rootfs="$3"
+    shift 3
 
-    exec unshare --uts --pid --fork --mount -- /bin/bash -c '
+    exec unshare "--uts=${ns_uts_path}" --pid --fork --mount -- /bin/bash -c '
         set -euo pipefail
 
         rootfs="$1"
