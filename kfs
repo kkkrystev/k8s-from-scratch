@@ -1,21 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOTFS="/var/lib/k8s-from-scratch/rootfs"
-
-if [[ -v CONTAINER_ROOTFS && -n "$CONTAINER_ROOTFS" ]]; then
-    ROOTFS="$CONTAINER_ROOTFS"
-fi
-
-CONTAINER_STATE_DIR="/var/lib/k8s-from-scratch/containers"
 ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
+POD_STATE_DIR="/var/lib/k8s-from-scratch/pods"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/validate.sh"
 source "${SCRIPT_DIR}/lib/etcd-client.sh"
 source "${SCRIPT_DIR}/lib/json.sh"
-source "${SCRIPT_DIR}/lib/meta.sh"
-source "${SCRIPT_DIR}/lib/namespace.sh"
 source "${SCRIPT_DIR}/lib/create.sh"
 source "${SCRIPT_DIR}/lib/list.sh"
 source "${SCRIPT_DIR}/lib/get.sh"
@@ -39,7 +31,7 @@ main() {
     shift
 
     case "$action" in
-        create) create_container "$@" ;;
+        create) create_pod "$@" ;;
         list)   cmd_list "$@" ;;
         get)    cmd_get "$@" ;;
         delete) cmd_delete "$@" ;;

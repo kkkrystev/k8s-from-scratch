@@ -1,21 +1,21 @@
 # list subcommand — pure reader.
-# Reads all container state from etcd. Never writes.
+# Reads all pod state from etcd. Never writes.
 # State corrections are the kubelet's responsibility.
 # Expects ETCD_DIR to be set and etcd-client.sh/json.sh sourced.
 
 cmd_list() {
     local keys
-    keys=$(etcd_list "containers") || true
+    keys=$(etcd_list "pods") || true
 
     if [[ -z "$keys" ]]; then
-        echo "No containers."
+        echo "No pods."
         return 0
     fi
 
     local names=()
     local key name
     while IFS= read -r key; do
-        name=$(echo "$key" | sed 's|^containers/||;s|/.*||')
+        name=$(echo "$key" | sed 's|^pods/||;s|/.*||')
         local already=0
         local n
         for n in "${names[@]:-}"; do
@@ -25,7 +25,7 @@ cmd_list() {
     done <<< "$keys"
 
     if [[ ${#names[@]} -eq 0 ]]; then
-        echo "No containers."
+        echo "No pods."
         return 0
     fi
 
@@ -33,7 +33,7 @@ cmd_list() {
 
     local status_json state started_at human_ts
     for name in "${names[@]}"; do
-        status_json=$(etcd_get "containers/${name}/status" 2>/dev/null) || status_json=""
+        status_json=$(etcd_get "pods/${name}/status" 2>/dev/null) || status_json=""
         if [[ -z "$status_json" ]]; then
             state="unknown"
             started_at=""

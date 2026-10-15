@@ -2,168 +2,135 @@
 set -euo pipefail
 
 ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
-CONTAINER_STATE_DIR="/var/lib/k8s-from-scratch/containers"
-ROOTFS="/var/lib/k8s-from-scratch/rootfs"
+POD_STATE_DIR="/var/lib/k8s-from-scratch/pods"
+KUBELET_LOG="/var/log/kubelet.log"
 RECONCILE_INTERVAL=5
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_SCRIPT="${SCRIPT_DIR}/runtime.sh"
 
 source "${SCRIPT_DIR}/lib/etcd-client.sh"
 source "${SCRIPT_DIR}/lib/json.sh"
 source "${SCRIPT_DIR}/lib/validate.sh"
 source "${SCRIPT_DIR}/lib/meta.sh"
-source "${SCRIPT_DIR}/lib/namespace.sh"
+
+mkdir -p "$(dirname "$KUBELET_LOG")"
+log() { echo "[kubelet] $*" | tee -a "$KUBELET_LOG"; }
 
 _launch() {
-    local name="$1"
+    local pod_name="$1"
     local spec_json="$2"
 
-    local cmd_json cmd_args=()
-    cmd_json=$(json_get_command "$spec_json")
+    local container_name
+    container_name=$(json_get_container_name "$spec_json")
+
+    local cmd_args=()
     while IFS= read -r arg; do
         [[ -n "$arg" ]] && cmd_args+=("$arg")
-    done <<< "$cmd_json"
+    done <<< "$(json_get_container_command "$spec_json")"
 
     if [[ ${#cmd_args[@]} -eq 0 ]]; then
-        echo "[kubelet] Pod '$name' has no command in spec, skipping." >&2
+        log "Pod '$pod_name' has no command in spec, skipping." >&2
         return 1
     fi
 
-    local cdir
-    cdir=$(container_dir "$name")
-    rm -rf "$cdir"
-    mkdir -p "$cdir"
+    local pod_dir
+    pod_dir=$(pod_dir "$pod_name")
+    rm -rf "$pod_dir"
+    mkdir -p "$pod_dir"
 
-    write_command "$cdir" "${cmd_args[@]}"
-    write_meta "$cdir" state "starting"
-    write_meta "$cdir" started_at "$(date +%s)"
-
-    local log="${cdir}/log"
+    local rootfs_path="${pod_dir}/rootfs"
+    local pod_log="${pod_dir}/log"
     local started_at
-    started_at=$(read_meta "$cdir" started_at)
+    started_at=$(date +%s)
 
-    etcd_put "containers/${name}/status" \
-        "$(json_build_status "starting" "$started_at" null null null "$log")"
+    json_build_container_spec "$container_name" "$rootfs_path" "${cmd_args[@]}" \
+        > "${pod_dir}/container-spec.json"
 
-    run_isolated "$name" "${cmd_args[@]}" </dev/null >"$log" 2>&1 &
-    local unshare_pid=$!
+    etcd_put "pods/${pod_name}/status" \
+        "$(json_build_status "starting" "$started_at" null null null "$pod_log")"
 
-    local ustart
-    ustart=$(read_pid_start "$unshare_pid")
-    write_meta "$cdir" unshare_pid "$unshare_pid"
-    write_meta "$cdir" unshare_start "$ustart"
+    "$RUNTIME_SCRIPT" start "$pod_name"
 
-    local workload_pid=""
-    if workload_pid=$(find_workload_pid "$unshare_pid"); then
-        local wstart
-        wstart=$(read_pid_start "$workload_pid")
-        write_meta "$cdir" workload_pid "$workload_pid"
-        write_meta "$cdir" workload_start "$wstart"
+    local state
+    state=$(read_meta "$pod_dir" state)
+
+    if [[ "$state" == "running" ]]; then
+        local workload_pid
+        workload_pid=$(read_meta "$pod_dir" workload_pid)
+        started_at=$(read_meta "$pod_dir" started_at)
+        etcd_put "pods/${pod_name}/status" \
+            "$(json_build_status "running" "$started_at" null null "$workload_pid" "$pod_log")"
+        log "Pod '$pod_name' started (PID $workload_pid)."
     else
-        write_meta "$cdir" workload_pid ""
-        write_meta "$cdir" workload_start ""
-        workload_pid=""
+        local exit_code exited_at
+        exit_code=$(read_meta "$pod_dir" exit_code)
+        exited_at=$(read_meta "$pod_dir" exited_at)
+        started_at=$(read_meta "$pod_dir" started_at)
+        etcd_put "pods/${pod_name}/status" \
+            "$(json_build_status "exited" "$started_at" "$exited_at" "$exit_code" null "$pod_log")"
+        log "Pod '$pod_name' exited immediately (code $exit_code)."
     fi
-
-    if ! kill -0 "$unshare_pid" 2>/dev/null; then
-        local exit_code=0
-        wait "$unshare_pid" 2>/dev/null || exit_code=$?
-        local exited_at
-        exited_at=$(date +%s)
-        write_meta "$cdir" state "exited"
-        write_meta "$cdir" exited_at "$exited_at"
-        write_meta "$cdir" exit_code "$exit_code"
-        etcd_put "containers/${name}/status" \
-            "$(json_build_status "exited" "$started_at" "$exited_at" "$exit_code" "$workload_pid" "$log")"
-        echo "[kubelet] Pod '$name' exited immediately (code $exit_code)."
-        return 0
-    fi
-
-    write_meta "$cdir" state "running"
-    etcd_put "containers/${name}/status" \
-        "$(json_build_status "running" "$started_at" null null "$workload_pid" "$log")"
-    echo "[kubelet] Pod '$name' started (PID ${workload_pid:-${unshare_pid}})."
 }
 
 _delete_pod() {
-    local name="$1"
-    local cdir
-    cdir=$(container_dir "$name")
-
-    if [[ -d "$cdir" ]]; then
-        local wpid wstart
-        wpid=$(read_meta "$cdir" workload_pid)
-        wstart=$(read_meta "$cdir" workload_start)
-        if [[ -n "$wpid" ]] && pid_is_ours "$wpid" "$wstart"; then
-            kill -SIGKILL "$wpid" 2>/dev/null || true
-            local i
-            for (( i = 0; i < 20; i++ )); do
-                pid_is_ours "$wpid" "$wstart" || break
-                sleep 0.1
-            done
-        fi
-        rm -rf "$cdir"
-    fi
-
-    etcd_delete "containers/${name}/spec"
-    etcd_delete "containers/${name}/status"
-    etcd_delete "containers/${name}/deleting"
-    echo "[kubelet] Pod '$name' deleted."
+    local pod_name="$1"
+    "$RUNTIME_SCRIPT" stop "$pod_name"
+    rm -rf "${ETCD_DIR}/pods/${pod_name}"
+    log "Pod '$pod_name' deleted."
 }
 
 reconcile_once() {
     local keys
-    keys=$(etcd_list "containers") || true
+    keys=$(etcd_list "pods") || true
     [[ -z "$keys" ]] && return 0
 
     local names=()
-    local key name
+    local key pod_name
     while IFS= read -r key; do
         [[ "$key" == */spec ]] || continue
-        name=$(echo "$key" | sed 's|^containers/||;s|/spec$||')
-        names+=("$name")
+        pod_name=$(echo "$key" | sed 's|^pods/||;s|/spec$||')
+        names+=("$pod_name")
     done <<< "$keys"
 
-    local spec_json actual cdir
-    for name in "${names[@]:-}"; do
-        [[ -z "$name" ]] && continue
+    local spec_json actual_state pod_dir
+    for pod_name in "${names[@]:-}"; do
+        [[ -z "$pod_name" ]] && continue
 
         # deletion branch: always checked first
-        if etcd_get "containers/${name}/deleting" >/dev/null 2>&1; then
-            _delete_pod "$name"
+        if etcd_get "pods/${pod_name}/deleting" >/dev/null 2>&1; then
+            _delete_pod "$pod_name"
             continue
         fi
 
-        spec_json=$(etcd_get "containers/${name}/spec" 2>/dev/null) || continue
+        spec_json=$(etcd_get "pods/${pod_name}/spec" 2>/dev/null) || continue
 
-        cdir=$(container_dir "$name")
-        actual=$(read_actual_state "$cdir")
+        pod_dir=$(pod_dir "$pod_name")
+        actual_state=$(read_actual_state "$pod_dir")
 
-        if [[ "$actual" == "running" ]]; then
-            # correct stale etcd status if needed
-            local etcd_state
-            etcd_state=$(etcd_get "containers/${name}/status" 2>/dev/null \
-                | (grep -o '"state":"[^"]*"' || true) \
-		| sed 's/"state":"//;s/"//')
+        if [[ "$actual_state" == "running" ]]; then
+            local status_json etcd_state
+            status_json=$(etcd_get "pods/${pod_name}/status" 2>/dev/null) || true
+            etcd_state=$(json_get_field "$status_json" "state")
             if [[ "$etcd_state" != "running" ]]; then
-                local started_at wpid log
-                started_at=$(read_meta "$cdir" started_at)
-                wpid=$(read_meta "$cdir" workload_pid)
-                log=$(read_meta "$cdir" log 2>/dev/null || echo "${cdir}/log")
-                etcd_put "containers/${name}/status" \
-                    "$(json_build_status "running" "$started_at" null null "$wpid" "$log")"
+                local started_at workload_pid pod_log
+                started_at=$(read_meta "$pod_dir" started_at)
+                workload_pid=$(read_meta "$pod_dir" workload_pid)
+                pod_log="${pod_dir}/log"
+                etcd_put "pods/${pod_name}/status" \
+                    "$(json_build_status "running" "$started_at" null null "$workload_pid" "$pod_log")"
             fi
             continue
         fi
 
         # exited or not_started: (re)launch
-        echo "[kubelet] Pod '$name' is '$actual', launching."
-        _launch "$name" "$spec_json"
+        log "Pod '$pod_name' is '$actual_state', launching."
+        _launch "$pod_name" "$spec_json"
     done
 }
 
-echo "[kubelet] Starting. Reconcile interval: ${RECONCILE_INTERVAL}s"
-echo "[kubelet] Press Ctrl+C to stop."
+log "Starting. Reconcile interval: ${RECONCILE_INTERVAL}s"
+log "Press Ctrl+C to stop."
 
 while true; do
     reconcile_once

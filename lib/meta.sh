@@ -1,8 +1,8 @@
 # Requires etcd-client.sh and json.sh to be sourced before this file.
-# Expects CONTAINER_STATE_DIR to be set by the caller.
+# Expects POD_STATE_DIR to be set by the caller.
 
-container_dir() {
-    echo "${CONTAINER_STATE_DIR}/$1"
+pod_dir() {
+    echo "${POD_STATE_DIR}/$1"
 }
 
 write_meta() {
@@ -26,6 +26,9 @@ read_pid_start() {
     awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true
 }
 
+# Checks that a PID still belongs to the same process we launched.
+# Linux can reuse a PID after a process exits, so we compare the process
+# start time recorded at launch against the current value in /proc.
 pid_is_ours() {
     local pid="$1" recorded_start="$2"
     [[ -f "/proc/${pid}/stat" ]] || return 1
@@ -34,6 +37,10 @@ pid_is_ours() {
     [[ "$current_start" == "$recorded_start" ]]
 }
 
+# Finds the PID of the command running inside the container namespace.
+# unshare --fork spawns exactly one child — the workload. Linux exposes that
+# child's PID in /proc/<unshare_pid>/task/<unshare_pid>/children. We retry
+# up to ~1s because the child may not appear there immediately after the fork.
 find_workload_pid() {
     local unshare_pid="$1"
     local children_file="/proc/${unshare_pid}/task/${unshare_pid}/children"
@@ -53,7 +60,6 @@ find_workload_pid() {
     return 1
 }
 
-# Pure read — never writes anything.
 # Returns the live state of a container based on the local state dir and /proc.
 # Prints one of: running, exited, not_started
 # A container stuck in "starting" for more than 10s with no workload PID is treated as exited.

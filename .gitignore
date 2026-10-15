@@ -1,0 +1,4 @@
+tests
+*.md
+claude-misc
+.DS_Store

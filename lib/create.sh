@@ -1,21 +1,21 @@
 # Expects ETCD_DIR to be set and etcd-client.sh / json.sh / validate.sh sourced.
 
-create_container() {
+create_pod() {
     if [[ $# -lt 2 ]]; then
         echo "Usage: $0 create <name> <command> [args...]" >&2
         return 1
     fi
 
-    local name="$1"
+    local pod_name="$1"
     shift
 
-    validate_name "$name"
+    validate_name "$pod_name"
 
-    if etcd_get "containers/${name}/spec" >/dev/null 2>&1; then
-        echo "Pod '$name' already exists." >&2
+    if etcd_get "pods/${pod_name}/spec" >/dev/null 2>&1; then
+        echo "Pod '$pod_name' already exists." >&2
         return 1
     fi
 
-    etcd_put "containers/${name}/spec" "$(json_build_spec "$name" "$@")"
-    echo "Pod '$name' created."
+    etcd_put "pods/${pod_name}/spec" "$(json_build_spec "$pod_name" "$@")"
+    echo "Pod '$pod_name' created."
 }

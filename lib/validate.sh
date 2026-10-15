@@ -1,12 +1,12 @@
 # Validation helpers.
-# Expects ROOTFS to be set by the caller (container.sh).
+# Expects ROOTFS to be set by the caller (kfs or runtime.sh).
 
 validate_name() {
     local name="$1"
 
     if [[ ${#name} -gt 63 ||
           ! "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
-        echo "Invalid container name: $name" >&2
+        echo "Invalid pod name: $name" >&2
         return 1
     fi
 }
@@ -19,7 +19,7 @@ validate_rootfs() {
 
     if [[ ! -d "$ROOTFS" ]]; then
         echo "Root filesystem directory does not exist: $ROOTFS" >&2
-        echo "Run setup-rootfs.sh with the same CONTAINER_ROOTFS setting." >&2
+        echo "Run setup-rootfs.sh with the same ROOTFS setting." >&2
         return 1
     fi
 
@@ -33,7 +33,7 @@ validate_rootfs() {
 validate_default_shell() {
     if [[ ! -x "$ROOTFS/bin/bash" ]]; then
         echo "Root filesystem has no executable /bin/bash: $ROOTFS" >&2
-        echo "Run setup-rootfs.sh with the same CONTAINER_ROOTFS setting." >&2
+        echo "Run setup-rootfs.sh with the same ROOTFS setting." >&2
         return 1
     fi
 }

@@ -1,98 +1,78 @@
-# JSON helpers for the fixed pod status schema.
-# These functions only handle the schemas defined in this project.
-# They are not a general-purpose JSON library.
+# JSON helpers for the fixed schemas used in this project.
+# Not a general-purpose JSON library — only handles the shapes defined here.
 
-# Emit a status JSON string.
-# Pass literal null (unquoted) for absent numeric/null fields.
-# Pass an empty string or null for absent string fields.
-#
 # Usage: json_build_status <state> <started_at> <exited_at> <exit_code> <workload_pid> <log>
 json_build_status() {
-    local state="$1"
-    local started_at="$2"
-    local exited_at="$3"
-    local exit_code="$4"
-    local workload_pid="$5"
-    local log="$6"
+    local state="$1" started_at="$2" exited_at="$3"
+    local exit_code="$4" workload_pid="$5" log="$6"
 
     local started_at_val exited_at_val exit_code_val workload_pid_val log_val
 
-    # Integers and null are unquoted; strings are quoted.
-    if [[ "$started_at" == "null" || -z "$started_at" ]]; then
-        started_at_val="null"
-    else
-        started_at_val="$started_at"
-    fi
-
-    if [[ "$exited_at" == "null" || -z "$exited_at" ]]; then
-        exited_at_val="null"
-    else
-        exited_at_val="$exited_at"
-    fi
-
-    if [[ "$exit_code" == "null" || -z "$exit_code" ]]; then
-        exit_code_val="null"
-    else
-        exit_code_val="$exit_code"
-    fi
-
-    if [[ "$workload_pid" == "null" || -z "$workload_pid" ]]; then
-        workload_pid_val="null"
-    else
-        workload_pid_val="$workload_pid"
-    fi
-
-    if [[ "$log" == "null" || -z "$log" ]]; then
-        log_val="null"
-    else
-        log_val="\"$log\""
-    fi
+    [[ "$started_at"   == "null" || -z "$started_at"   ]] && started_at_val="null"   || started_at_val="$started_at"
+    [[ "$exited_at"    == "null" || -z "$exited_at"    ]] && exited_at_val="null"    || exited_at_val="$exited_at"
+    [[ "$exit_code"    == "null" || -z "$exit_code"    ]] && exit_code_val="null"    || exit_code_val="$exit_code"
+    [[ "$workload_pid" == "null" || -z "$workload_pid" ]] && workload_pid_val="null" || workload_pid_val="$workload_pid"
+    [[ "$log"          == "null" || -z "$log"          ]] && log_val="null"          || log_val="\"$log\""
 
     printf '{"state":"%s","started_at":%s,"exited_at":%s,"exit_code":%s,"workload_pid":%s,"log":%s}' \
         "$state" "$started_at_val" "$exited_at_val" "$exit_code_val" "$workload_pid_val" "$log_val"
 }
 
-# Emit a spec JSON string.
-# command_args are the individual argv elements.
-#
-# Usage: json_build_spec <name> <command_arg1> [command_arg2 ...]
+# Pod spec with a containers array.
+# Usage: json_build_spec <pod-name> <executable> [arg1 arg2 ...]
 json_build_spec() {
-    local name="$1"
+    local pod_name="$1"
     shift
-    local args_json=""
-    local arg
+    local args_json="" arg
     for arg in "$@"; do
-        if [[ -n "$args_json" ]]; then
-            args_json+=","
-        fi
+        [[ -n "$args_json" ]] && args_json+=","
         args_json+="\"$arg\""
     done
-    printf '{"name":"%s","command":[%s]}' "$name" "$args_json"
+    printf '{"name":"%s","containers":[{"name":"%s","command":[%s]}]}' \
+        "$pod_name" "$pod_name" "$args_json"
 }
 
-# Extract the value of a field from a status or spec JSON string.
-# Returns the raw value: a quoted string without its outer quotes,
-# an integer, or the literal null.
-#
+# Container spec written by the kubelet into the local state dir for the runtime to read.
+# Usage: json_build_container_spec <name> <rootfs-path> <executable> [arg1 arg2 ...]
+json_build_container_spec() {
+    local container_name="$1" rootfs_path="$2"
+    shift 2
+    local args_json="" arg
+    for arg in "$@"; do
+        [[ -n "$args_json" ]] && args_json+=","
+        args_json+="\"$arg\""
+    done
+    printf '{"name":"%s","rootfs":"%s","command":[%s]}' \
+        "$container_name" "$rootfs_path" "$args_json"
+}
+
+# Extract a scalar field value from a JSON object.
+# Returns the value without surrounding quotes for strings.
 # Usage: json_get_field <json> <fieldname>
 json_get_field() {
     local json="$1" field="$2"
-    # Match: "field":VALUE where VALUE is "string", integer, or null.
-    # Strip surrounding quotes from string values.
     echo "$json" \
         | grep -oE "\"${field}\":(\"[^\"]*\"|[0-9]+|null)" \
         | sed -E "s/\"${field}\"://;s/^\"|\"$//g"
 }
 
-# Extract the command array from a spec JSON string as separate lines.
-# Each element is printed on its own line (quotes stripped).
-#
-# Usage: json_get_command <spec_json>
-json_get_command() {
-    local json="$1"
-    echo "$json" \
+# Extract the command from the first container in a pod spec, one arg per line.
+# Usage: json_get_container_command <spec_json>
+json_get_container_command() {
+    local spec_json="$1"
+    echo "$spec_json" \
         | grep -oE '"command":\[[^]]*\]' \
+        | head -1 \
         | sed 's/"command":\[//;s/\]//' \
         | tr ',' '\n' \
         | sed 's/^"//;s/"$//'
+}
+
+# Extract the name of the first container in a pod spec.
+# Usage: json_get_container_name <spec_json>
+json_get_container_name() {
+    local spec_json="$1"
+    echo "$spec_json" \
+        | grep -oE '"containers":\[\{"name":"[^"]*"' \
+        | sed 's/.*"containers":\[{"name":"//;s/"//'
 }

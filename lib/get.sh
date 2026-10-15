@@ -1,11 +1,11 @@
 # get subcommand — pure reader.
-# Reads all container state from etcd. Never writes.
+# Reads all pod state from etcd. Never writes.
 # State corrections are the kubelet's responsibility.
 # Expects ETCD_DIR to be set and etcd-client.sh/json.sh/validate.sh sourced.
 
 cmd_get() {
     if [[ $# -eq 0 ]]; then
-        echo "Missing container name." >&2
+        echo "Missing pod name." >&2
         echo "Usage: $0 get <name>" >&2
         return 1
     fi
@@ -14,10 +14,10 @@ cmd_get() {
     validate_name "$name"
 
     local status_json
-    status_json=$(etcd_get "containers/${name}/status" 2>/dev/null) || true
+    status_json=$(etcd_get "pods/${name}/status" 2>/dev/null) || true
 
     if [[ -z "$status_json" ]]; then
-        echo "Container '$name' not found." >&2
+        echo "Pod '$name' not found." >&2
         return 1
     fi
 

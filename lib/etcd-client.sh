@@ -27,7 +27,7 @@ etcd_delete() {
 }
 
 # Print one key per line whose path starts with the given prefix.
-# Prefix is treated as a directory name — "containers" lists everything under etcd/containers/.
+# Prefix is treated as a directory name -- "containers" lists everything under etcd/containers/.
 etcd_list() {
     local prefix="${1:-}"
     local base="${ETCD_DIR}/${prefix}"

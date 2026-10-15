@@ -14,13 +14,13 @@ cmd_delete() {
             continue
         fi
 
-        if ! etcd_get "containers/${name}/spec" >/dev/null 2>&1; then
+        if ! etcd_get "pods/${name}/spec" >/dev/null 2>&1; then
             echo "Pod '$name' not found." >&2
             failed=1
             continue
         fi
 
-        etcd_put "containers/${name}/deleting" "1"
+        etcd_put "pods/${name}/deleting" "1"
         echo "Pod '$name' marked for deletion."
     done
 
