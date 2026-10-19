@@ -1,46 +1,25 @@
-# get subcommand — pure reader.
-# Reads all pod state from etcd. Never writes.
-# State corrections are the kubelet's responsibility.
-# Expects ETCD_DIR to be set and etcd-client.sh/json.sh/validate.sh sourced.
+# Pure etcd reader: spec determines existence, status is the last observation.
 
 cmd_get() {
-    if [[ $# -eq 0 ]]; then
-        echo "Missing pod name." >&2
-        echo "Usage: $0 get <name>" >&2
-        return 1
-    fi
-
-    local name="$1"
-    validate_name "$name"
-
-    local status_json
-    status_json=$(etcd_get "pods/${name}/status" 2>/dev/null) || true
-
-    if [[ -z "$status_json" ]]; then
+    [[ $# -eq 1 ]] || { echo "Usage: $0 get <name>" >&2; return 1; }
+    local name="$1" status state started exited code log pod_ip
+    validate_name "$name" || return 1
+    if ! etcd_get "pods/$name/spec" >/dev/null; then
         echo "Pod '$name' not found." >&2
         return 1
     fi
-
-    local state started_at exited_at exit_code log_path
-    state=$(json_get_field "$status_json" "state")
-    started_at=$(json_get_field "$status_json" "started_at")
-    exited_at=$(json_get_field "$status_json" "exited_at")
-    exit_code=$(json_get_field "$status_json" "exit_code")
-    log_path=$(json_get_field "$status_json" "log")
-
-    _fmt_ts() {
-        local t="$1"
-        if [[ -n "$t" && "$t" != "null" ]]; then
-            date -d "@${t}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-            || date -r "$t" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-            || echo "$t"
-        fi
-    }
-
-    echo "Name:      $name"
-    echo "State:     $state"
-    echo "Started:   $(_fmt_ts "$started_at")"
-    [[ -n "$exited_at"  && "$exited_at"  != "null" ]] && echo "Exited:    $(_fmt_ts "$exited_at")"
-    [[ -n "$exit_code"  && "$exit_code"  != "null" ]] && echo "Exit code: $exit_code"
-    echo "Log:       ${log_path:-}"
+    status=$(etcd_get "pods/$name/status") || status=""
+    state=$(json_get_field "$status" state) || return 1
+    started=$(json_get_field "$status" started_at) || return 1
+    exited=$(json_get_field "$status" exited_at) || return 1
+    code=$(json_get_field "$status" exit_code) || return 1
+    log=$(json_get_field "$status" log) || return 1
+    pod_ip=$(json_get_field "$status" pod_ip) || return 1
+    if [[ -n "$started" ]]; then started=$(date -d "@$started" '+%Y-%m-%d %H:%M:%S') || return 1; fi
+    if [[ -n "$exited" ]]; then exited=$(date -d "@$exited" '+%Y-%m-%d %H:%M:%S') || return 1; fi
+    printf 'Name:      %s\nState:     %s\nIP:        %s\nStarted:   %s\n' \
+        "$name" "${state:-pending}" "${pod_ip:--}" "${started:--}"
+    if [[ -n "$exited" ]]; then printf 'Exited:    %s\n' "$exited"; fi
+    if [[ -n "$code" ]]; then printf 'Exit code: %s\n' "$code"; fi
+    printf 'Log:       %s\n' "${log:--}"
 }

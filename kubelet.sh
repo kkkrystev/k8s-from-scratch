@@ -1,120 +1,156 @@
 #!/bin/bash
 set -euo pipefail
 
-ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
-POD_STATE_DIR="/var/lib/k8s-from-scratch/pods"
-KUBELET_LOG="/var/log/kubelet.log"
-RECONCILE_INTERVAL=5
+ETCD_DIR="${ETCD_DIR:-/var/lib/k8s-from-scratch/etcd}"
+POD_STATE_DIR="${POD_STATE_DIR:-/var/lib/k8s-from-scratch/pods}"
+NAMESPACE_DIR="${NAMESPACE_DIR:-/run/k8s-from-scratch}"
+KUBELET_LOG="${KUBELET_LOG:-/var/log/kubelet.log}"
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-5}"
+
+export POD_STATE_DIR NAMESPACE_DIR
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RUNTIME_SCRIPT="${SCRIPT_DIR}/runtime.sh"
+RUNTIME_SCRIPT="$SCRIPT_DIR/runtime.sh"
 
-source "${SCRIPT_DIR}/lib/etcd-client.sh"
-source "${SCRIPT_DIR}/lib/json.sh"
-source "${SCRIPT_DIR}/lib/validate.sh"
+source "$SCRIPT_DIR/lib/etcd-client.sh"
+source "$SCRIPT_DIR/lib/json.sh"
+source "$SCRIPT_DIR/lib/validate.sh"
+source "$SCRIPT_DIR/lib/network.sh"
 
-mkdir -p "$(dirname "$KUBELET_LOG")"
-log() { echo "[kubelet] $*" | tee -a "$KUBELET_LOG"; }
+log() { printf '[kubelet] %s\n' "$*" | tee -a "$KUBELET_LOG"; }
 
-_launch() {
-    local pod_name="$1"
-    local spec_json="$2"
+# IPAM: subnet 10.244.0.0/24, .2-.254 allocatable.
+IPAM_PREFIX="ipam/10.244.0.0-24"
 
-    local cmd_args=()
-    while IFS= read -r arg; do
-        [[ -n "$arg" ]] && cmd_args+=("$arg")
-    done <<< "$(json_get_container_command "$spec_json")"
-
-    if [[ ${#cmd_args[@]} -eq 0 ]]; then
-        log "Pod '$pod_name' has no command in spec, skipping."
-        return 1
+ipam_allocate() {
+    local name="$1" key ip existing
+    # Reuse an existing reservation for this pod name.
+    local all_keys
+    all_keys=$(etcd_list "$IPAM_PREFIX") || all_keys=""
+    if [[ -n "$all_keys" ]]; then
+        while IFS= read -r key; do
+            [[ -n "$key" ]] || continue
+            existing=$(etcd_get "$key") || continue
+            if [[ "$existing" == "$name" ]]; then
+                ip="${key##*/}"
+                printf '%s' "$ip"
+                return 0
+            fi
+        done <<< "$all_keys"
     fi
-
-    local pod_log="${POD_STATE_DIR}/${pod_name}/log"
-
-    etcd_put "pods/${pod_name}/status" \
-        "$(json_build_status "starting" "$(date +%s)" null null "$pod_log")"
-
-    local result_json
-    result_json=$("$RUNTIME_SCRIPT" start "$pod_name" -- "${cmd_args[@]}")
-
-    local state started_at
-    state=$(json_get_field "$result_json" "state")
-    started_at=$(json_get_field "$result_json" "started_at")
-
-    if [[ "$state" == "running" ]]; then
-        etcd_put "pods/${pod_name}/status" "$result_json"
-        log "Pod '$pod_name' started."
-    else
-        local exit_code
-        exit_code=$(json_get_field "$result_json" "exit_code")
-        etcd_put "pods/${pod_name}/status" "$result_json"
-        log "Pod '$pod_name' exited immediately (code ${exit_code})."
-    fi
+    # Allocate the lowest free address.
+    local last_octet
+    for ((last_octet=2; last_octet<=254; last_octet++)); do
+        ip="10.244.0.$last_octet"
+        if ! etcd_get "$IPAM_PREFIX/$ip" >/dev/null 2>&1; then
+            etcd_put "$IPAM_PREFIX/$ip" "$name" || return 1
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    echo "ipam: address space exhausted (all 253 addresses allocated)." >&2
+    return 1
 }
 
-_delete_pod() {
-    local pod_name="$1"
-    "$RUNTIME_SCRIPT" stop "$pod_name"
-    local exited_at
-    exited_at=$(date +%s)
-    etcd_put "pods/${pod_name}/status" \
-        "$(json_build_status "terminated" null "$exited_at" null null)"
-    log "Pod '$pod_name' terminated."
+ipam_free() {
+    local name="$1" key existing
+    local all_keys
+    all_keys=$(etcd_list "$IPAM_PREFIX") || all_keys=""
+    [[ -n "$all_keys" ]] || return 0
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        existing=$(etcd_get "$key") || continue
+        if [[ "$existing" == "$name" ]]; then
+            etcd_delete "$key" || return 1
+            return 0
+        fi
+    done <<< "$all_keys"
+}
+
+launch_pod() {
+    local name="$1" spec="$2" result command_file pod_ip
+    local args=()
+    command_file=$(mktemp) || return 1
+    if ! json_get_container_command "$spec" > "$command_file"; then
+        rm -f "$command_file"
+        return 1
+    fi
+    mapfile -d '' -t args < "$command_file"
+    rm -f "$command_file" || return 1
+
+    pod_ip=$(ipam_allocate "$name") || {
+        result=$(json_build_status unknown null null null "$POD_STATE_DIR/$name/log") || return 1
+        etcd_put "pods/$name/status" "$result" || return 1
+        return 1
+    }
+
+    result=$(json_build_status starting "$(date +%s)" null null "$POD_STATE_DIR/$name/log") || return 1
+    etcd_put "pods/$name/status" "$result" || return 1
+
+    if ! result=$("$RUNTIME_SCRIPT" start "$name" --ip "$pod_ip" -- "${args[@]}" 8>&-); then
+        result=$(json_build_status unknown null null null "$POD_STATE_DIR/$name/log") || return 1
+        etcd_put "pods/$name/status" "$result" || return 1
+        return 1
+    fi
+    etcd_put "pods/$name/status" "$result" || return 1
+    log "Pod '$name': $(json_get_field "$result" state), ip=$(json_get_field "$result" pod_ip)."
+}
+
+reconcile_pod() {
+    local name="$1" spec actual status state result pod_ip
+    validate_name "$name" || return 1
+    spec=$(etcd_get "pods/$name/spec") || return 0
+    if etcd_get "pods/$name/deleting" >/dev/null; then
+        "$RUNTIME_SCRIPT" stop "$name" 8>&- || return 1
+        ipam_free "$name" || return 1
+        status=$(etcd_get "pods/$name/status") || status=""
+        state=$(json_get_field "$status" state) || return 1
+        if [[ "$state" != terminated ]]; then
+            result=$(json_build_status terminated null "$(date +%s)" null null) || return 1
+            etcd_put "pods/$name/status" "$result" || return 1
+            log "Pod '$name' terminated."
+        fi
+        return 0
+    fi
+    if ! actual=$("$RUNTIME_SCRIPT" status "$name" 8>&-); then
+        result=$(json_build_status unknown null null null "$POD_STATE_DIR/$name/log") || return 1
+        etcd_put "pods/$name/status" "$result" || return 1
+        return 1
+    fi
+    if [[ "$actual" == running ]]; then
+        status=$(etcd_get "pods/$name/status") || status=""
+        state=$(json_get_field "$status" state) || return 1
+        if [[ "$state" != running ]]; then
+            # Read actual IP from live netns rather than stale status.
+            pod_ip=$(net_read_pod_ip "$NAMESPACE_DIR/$name/net") || pod_ip=""
+            result=$(json_build_status running null null null "$POD_STATE_DIR/$name/log" "${pod_ip:-null}") || return 1
+            etcd_put "pods/$name/status" "$result" || return 1
+        fi
+    elif [[ "$actual" == exited ]]; then
+        launch_pod "$name" "$spec" || return 1
+    else
+        echo "Unexpected runtime state: $actual" >&2
+        return 1
+    fi
 }
 
 reconcile_once() {
-    local keys
-    keys=$(etcd_list "pods") || true
-    [[ -z "$keys" ]] && return 0
-
-    local names=()
-    local key pod_name
-    while IFS= read -r key; do
-        [[ "$key" == */spec ]] || continue
-        pod_name=$(echo "$key" | sed 's|^pods/||;s|/spec$||')
-        names+=("$pod_name")
-    done <<< "$keys"
-
-    local spec_json actual_state
-    for pod_name in "${names[@]:-}"; do
-        [[ -z "$pod_name" ]] && continue
-
-        # deletion branch: always checked first
-        if etcd_get "pods/${pod_name}/deleting" >/dev/null 2>&1; then
-            _delete_pod "$pod_name"
-            continue
+    local names name
+    names=$(etcd_pod_names) || return 1
+    [[ -n "$names" ]] || return 0
+    while IFS= read -r name; do
+        if ! reconcile_pod "$name"; then
+            log "Reconciliation failed for '$name'; will retry."
         fi
-
-        spec_json=$(etcd_get "pods/${pod_name}/spec" 2>/dev/null) || continue
-
-        actual_state=$("$RUNTIME_SCRIPT" status "$pod_name")
-
-        if [[ "$actual_state" == "running" ]]; then
-            local status_json etcd_state
-            status_json=$(etcd_get "pods/${pod_name}/status" 2>/dev/null) || true
-            etcd_state=$(json_get_field "$status_json" "state")
-            if [[ "$etcd_state" != "running" ]]; then
-                # Runtime says running but etcd disagrees -- correct it.
-                local started_at pod_log
-                started_at=$(json_get_field "$status_json" "started_at")
-                pod_log="${POD_STATE_DIR}/${pod_name}/log"
-                etcd_put "pods/${pod_name}/status" \
-                    "$(json_build_status "running" "$started_at" null null "$pod_log")"
-            fi
-            continue
-        fi
-
-        # exited or never started: (re)launch
-        log "Pod '$pod_name' is '$actual_state', launching."
-        _launch "$pod_name" "$spec_json"
-    done
+    done <<< "$names"
 }
 
+mkdir -p "$(dirname "$KUBELET_LOG")" "$ETCD_DIR"
+# One reconciliation loop per fake-etcd directory. Do not pass this lock to runtime.
+exec 8>"$ETCD_DIR/.kubelet.lock"
+flock -n 8 || { echo 'A kubelet already uses this etcd directory.' >&2; exit 1; }
 log "Starting. Reconcile interval: ${RECONCILE_INTERVAL}s"
-log "Press Ctrl+C to stop."
-
 while true; do
-    reconcile_once
+    if ! reconcile_once; then log 'Cannot list pods; will retry.'; fi
     sleep "$RECONCILE_INTERVAL"
 done

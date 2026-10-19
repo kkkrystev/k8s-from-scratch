@@ -23,27 +23,40 @@ if [[ "$ROOTFS" != /* ]]; then
     exit 1
 fi
 
-if [[ -e "$ROOTFS" || -L "$ROOTFS"  ]]; then
-    echo "Directory already exists: $ROOTFS"
-    echo "Stopping to avoid overwriting it."
-    exit 1
+if [[ -e "$ROOTFS" ]]; then
+    # If both tools are already present, nothing to do.
+    if [[ -x "$ROOTFS/bin/ping" && ( -x "$ROOTFS/bin/nc" || -x "$ROOTFS/usr/bin/nc" ) ]]; then
+        echo "Rootfs already prepared: $ROOTFS"
+        exit 0
+    fi
+    if [[ ! -x "$ROOTFS/bin/bash" ]]; then
+        echo "Rootfs at $ROOTFS exists but appears incomplete (no /bin/bash). Remove it and re-run." >&2
+        exit 1
+    fi
+    echo "Rootfs exists; installing missing networking tools..."
+else
+    echo "Downloading Ubuntu Base for $ARCH..."
+    curl --fail --location \
+        "$BASE_URL/$ARCHIVE" \
+        --output "/tmp/$ARCHIVE"
+
+    echo "Extracting filesystem into ${ROOTFS}..."
+    mkdir -p "$ROOTFS"
+    tar --extract --gzip \
+        --file="/tmp/$ARCHIVE" \
+        --directory="$ROOTFS"
+
+    rm -f -- "/tmp/$ARCHIVE"
+    echo "Extraction complete."
 fi
 
-echo "Downloading Ubuntu Base for $ARCH..."
-curl --fail --location \
-    "$BASE_URL/$ARCHIVE" \
-    --output "/tmp/$ARCHIVE"
+echo "nameserver 8.8.8.8" > "$ROOTFS/etc/resolv.conf"
 
-echo "Extracting filesystem into ${ROOTFS}..."
-mkdir -p "$ROOTFS"
-tar --extract --gzip \
-    --file="/tmp/$ARCHIVE" \
-    --directory="$ROOTFS"
+echo "Installing iputils-ping and netcat-openbsd into rootfs..."
+chroot "$ROOTFS" apt-get update -q --allow-insecure-repositories
+chroot "$ROOTFS" apt-get install -y --no-install-recommends \
+    --allow-unauthenticated \
+    gpgv iputils-ping netcat-openbsd
+chroot "$ROOTFS" apt-get clean
 
-rm -f -- "/tmp/$ARCHIVE"
-
-echo "Root filesystem ready:"
-ls "$ROOTFS"
-
-echo "Entering the new filesystem. Type exit to return."
-chroot "$ROOTFS" /bin/bash
+echo "Root filesystem ready: $ROOTFS"

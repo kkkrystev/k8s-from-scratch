@@ -1,40 +1,35 @@
-# Expects ETCD_DIR to be set and etcd-client.sh / validate.sh / json.sh sourced.
-
 cmd_delete() {
-    if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 delete <name> [name ...]" >&2
-        return 1
-    fi
-
-    local failed=0
-
+    [[ $# -gt 0 ]] || { echo "Usage: $0 delete <name> [name ...]" >&2; return 1; }
+    local timeout="${DELETE_TIMEOUT:-30}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo 'DELETE_TIMEOUT must be positive seconds.' >&2; return 1; }
+    local name status state deadline failed=0 done_deleting
     for name in "$@"; do
-        if ! validate_name "$name"; then
-            failed=1
-            continue
-        fi
-
-        if ! etcd_get "pods/${name}/spec" >/dev/null 2>&1; then
+        if ! validate_name "$name"; then failed=1; continue; fi
+        if ! etcd_get "pods/$name/spec" >/dev/null; then
             echo "Pod '$name' not found." >&2
             failed=1
             continue
         fi
-
-        etcd_put "pods/${name}/deleting" "1"
+        if ! etcd_put "pods/$name/deleting" 1; then failed=1; continue; fi
         echo "Pod '$name' marked for deletion, waiting..."
-
-        # Poll until kubelet writes terminated status, then clean up etcd.
-        local status_json state
-        while true; do
-            status_json=$(etcd_get "pods/${name}/status" 2>/dev/null) || true
-            state=$(json_get_field "$status_json" "state")
-            [[ "$state" == "terminated" ]] && break
-            sleep 1
+        deadline=$((SECONDS + timeout))
+        done_deleting=0
+        while ((SECONDS < deadline)); do
+            status=$(etcd_get "pods/$name/status") || status=""
+            if ! state=$(json_get_field "$status" state); then break; fi
+            if [[ "$state" == terminated ]]; then
+                if rm -rf -- "$ETCD_DIR/pods/$name"; then
+                    echo "Pod '$name' deleted."
+                    done_deleting=1
+                fi
+                break
+            fi
+            sleep 0.2
         done
-
-        rm -rf "${ETCD_DIR}/pods/${name}"
-        echo "Pod '$name' deleted."
+        if [[ $done_deleting -eq 0 ]]; then
+            echo "Deletion not completed within ${timeout}s for '$name'. Request retained; check kubelet and retry delete." >&2
+            failed=1
+        fi
     done
-
-    return $failed
+    return "$failed"
 }

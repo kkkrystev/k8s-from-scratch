@@ -1,46 +1,37 @@
-# Fake etcd client.
-# Expects ETCD_DIR to be set by the caller.
-#
-# In real etcd, keys like "pods/myapp/spec" are flat strings — the slashes are
-# just a naming convention, not a directory structure. Here we approximate that
-# by mapping each key to a file on disk, which means the slashes become real
-# directories. The semantics are the same; the storage is not.
-
-# Store a value at the given key.
+# Filesystem-backed teaching approximation of etcd. Not real etcd transactions.
 etcd_put() {
-    local key="$1" value="$2"
-    local path="${ETCD_DIR}/${key}"
-    mkdir -p "$(dirname "$path")"
-    local tmp
-    tmp=$(mktemp "${path}.XXXXXX")
-    printf '%s' "$value" > "$tmp"
-    mv "$tmp" "$path"
-}
-
-# Read the value stored at the given key. Fails if the key does not exist.
-etcd_get() {
-    local key="$1"
-    local path="${ETCD_DIR}/${key}"
-    if [[ ! -f "$path" ]]; then
+    local path="$ETCD_DIR/$1" value="$2" tmp
+    mkdir -p -- "$(dirname -- "$path")" || return 1
+    tmp=$(mktemp "${path}.XXXXXX") || return 1
+    if ! printf '%s' "$value" > "$tmp" || ! mv -- "$tmp" "$path"; then
+        rm -f -- "$tmp"
         return 1
     fi
-    cat "$path"
 }
 
-# Delete a key. No-op if it does not exist.
-etcd_delete() {
-    local key="$1"
-    local path="${ETCD_DIR}/${key}"
-    rm -f "$path"
+etcd_get() {
+    [[ -f "$ETCD_DIR/$1" ]] || return 1
+    cat -- "$ETCD_DIR/$1"
 }
 
-# List all keys that start with a given prefix, one per line.
-# e.g. etcd_list "pods" returns "pods/myapp/spec", "pods/myapp/status", etc.
+etcd_delete() { rm -f -- "$ETCD_DIR/$1"; }
+
 etcd_list() {
-    local prefix="${1:-}"
-    local base="${ETCD_DIR}/${prefix}"
+    local base="$ETCD_DIR/${1:-}" path
     [[ -d "$base" ]] || return 0
-    find "$base" -type f | while read -r path; do
-        echo "${path#${ETCD_DIR}/}"
+    find "$base" -type f | while IFS= read -r path; do
+        printf '%s\n' "${path#"$ETCD_DIR/"}"
     done
+}
+
+etcd_pod_names() {
+    local keys key name
+    keys=$(etcd_list pods) || return 1
+    while IFS= read -r key; do
+        [[ "$key" == pods/*/spec ]] || continue
+        name=${key#pods/}
+        name=${name%/spec}
+        [[ "$name" != */* ]] || continue
+        printf '%s\n' "$name"
+    done <<< "$keys"
 }

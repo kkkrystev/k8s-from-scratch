@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
+ETCD_DIR="${ETCD_DIR:-/var/lib/k8s-from-scratch/etcd}"
 POD_STATE_DIR="/var/lib/k8s-from-scratch/pods"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

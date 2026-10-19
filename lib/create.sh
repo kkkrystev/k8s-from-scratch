@@ -15,7 +15,12 @@ create_pod() {
         echo "Pod '$pod_name' already exists." >&2
         return 1
     fi
-
-    etcd_put "pods/${pod_name}/spec" "$(json_build_spec "$pod_name" "$@")"
+    
+    # Metadata without a spec belongs to no declared pod.
+    etcd_delete "pods/${pod_name}/status" || return 1
+    etcd_delete "pods/${pod_name}/deleting" || return 1
+    local spec
+    spec=$(json_build_spec "$pod_name" "$@") || return 1
+    etcd_put "pods/${pod_name}/spec" "$spec" || return 1
     echo "Pod '$pod_name' created."
 }

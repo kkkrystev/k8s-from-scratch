@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y \
     bash \
     coreutils \
+    jq \
     util-linux \
     procps \
     iproute2 \
@@ -16,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     strace \
     xz-utils \
+    netcat-openbsd \
     && yes | unminimize \
     && rm -rf /var/lib/apt/lists/*
 
