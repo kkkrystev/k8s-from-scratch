@@ -9,7 +9,7 @@ create_pod() {
     local pod_name="$1"
     shift
 
-    validate_name "$pod_name"
+    validate_name "$pod_name" || return 1
 
     if etcd_get "pods/${pod_name}/spec" >/dev/null 2>&1; then
         echo "Pod '$pod_name' already exists." >&2

@@ -1,19 +1,32 @@
 # Fixed project schemas, encoded/decoded by jq rather than regular expressions.
 json_build_status() {
-    jq -cn --arg state "$1" --arg started "${2:-null}" \
-        --arg exited "${3:-null}" --arg code "${4:-null}" --arg log "${5:-null}" \
+    jq -cn \
+        --arg state "$1" \
+        --arg started "${2:-null}" \
+        --arg exited "${3:-null}" \
+        --arg code "${4:-null}" \
+        --arg log "${5:-null}" \
         --arg ip "${6:-null}" '
-        {state:$state, started_at:($started|fromjson),
-         exited_at:($exited|fromjson), exit_code:($code|fromjson),
-         log:(if $log == "null" then null else $log end),
-         pod_ip:(if $ip == "null" then null else $ip end)}'
+        {
+            state: $state,
+            started_at: ($started | fromjson),
+            exited_at: ($exited | fromjson),
+            exit_code: ($code | fromjson),
+            log: (if $log == "null" then null else $log end),
+            pod_ip: (if $ip == "null" then null else $ip end)
+        }
+    '
 }
 
 json_build_spec() {
     local name="$1"
     shift
+
     jq -cn --arg name "$name" --args \
-        '{name:$name,containers:[{name:$name,command:$ARGS.positional}]}' -- "$@"
+        '{
+            name: $name,
+            containers: [{name: $name, command: $ARGS.positional}]
+        }' -- "$@"
 }
 
 json_get_field() {

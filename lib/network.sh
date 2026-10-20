@@ -12,7 +12,7 @@ BRIDGE="kfs0"
 BRIDGE_ADDR="10.244.0.1/24"
 
 # Derive the host-side veth name for a pod.
-# Format: kfsv + first 11 hex chars of sha256(name) = 15 chars total (IFNAMSIZ limit).
+# Format: kfsv + 10 hex chars = 14 chars; the peer adds a p suffix.
 # Collision probability across 253 pods is negligible; documented as a known limit.
 net_veth_name() {
     local name="$1"
@@ -39,6 +39,7 @@ net_ensure_bridge() {
         fi
         return 0
     fi
+
     ip link add "$BRIDGE" type bridge || return 1
     ip addr add "$BRIDGE_ADDR" dev "$BRIDGE" || return 1
     ip link set "$BRIDGE" up || return 1
@@ -48,22 +49,21 @@ net_ensure_bridge() {
 # configure eth0 with the given IP and bring up both eth0 and lo.
 # Arguments: <pod-name> <netns-path> <ip>
 net_attach_pod() {
-    local name="$1" netns="$2" ip="$3"
-    local hveth pveth
+    local name="$1" netns="$2" pod_ip="$3"
+    local hveth pveth master existing_ip
+
     hveth=$(net_veth_name "$name")
     # Pod-side veth peer: same name with 'p' suffix, renamed to eth0 after moving into netns.
     # Avoids collision with the host's own eth0 interface.
     pveth="${hveth}p"
 
-    # Idempotency: if already fully wired, return 0.
+    # Reuse a matching bridge/IP configuration. This is not a health check.
     if ip link show "$hveth" >/dev/null 2>&1; then
-        local master
         master=$(ip -j link show "$hveth" | jq -r '.[0].master // empty')
         if [[ "$master" == "$BRIDGE" ]]; then
-            local existing_ip
             existing_ip=$(nsenter --net="$netns" ip -j addr show eth0 2>/dev/null \
                 | jq -r '.[0].addr_info[]? | select(.family=="inet") | .local // empty' 2>/dev/null) || true
-            if [[ "$existing_ip" == "$ip" ]]; then
+            if [[ "$existing_ip" == "$pod_ip" ]]; then
                 return 0
             fi
         fi
@@ -93,9 +93,9 @@ net_attach_pod() {
     fi
 
     # Configure the pod end from the host via nsenter.
-    if ! nsenter --net="$netns" ip addr add "${ip}/24" dev eth0 \
-    || ! nsenter --net="$netns" ip link set eth0 up \
-    || ! nsenter --net="$netns" ip link set lo up; then
+    if ! nsenter --net="$netns" ip addr add "${pod_ip}/24" dev eth0 \
+        || ! nsenter --net="$netns" ip link set eth0 up \
+        || ! nsenter --net="$netns" ip link set lo up; then
         net_detach_pod "$name"
         return 1
     fi
@@ -103,17 +103,17 @@ net_attach_pod() {
 
 # Remove the host-side veth for a pod. Auto-removes the pod end of the pair.
 # Idempotent: no-op if the veth does not exist.
-# Verifies the veth is enslaved to the project bridge before deleting.
+# Refuses deletion when attached to another bridge; allows an unattached peer.
 net_detach_pod() {
     local name="$1"
-    local hveth
+    local hveth master
+
     hveth=$(net_veth_name "$name")
 
     if ! ip link show "$hveth" >/dev/null 2>&1; then
         return 0
     fi
 
-    local master
     master=$(ip -j link show "$hveth" | jq -r '.[0].master // empty')
     if [[ -n "$master" && "$master" != "$BRIDGE" ]]; then
         echo "net: '$hveth' exists but is enslaved to '$master', not '$BRIDGE'; not deleting." >&2

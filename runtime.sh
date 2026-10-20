@@ -1,82 +1,193 @@
 #!/bin/bash
 set -euo pipefail
 
+# Configuration and dependencies
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 GLOBAL_ROOTFS="${ROOTFS:-/var/lib/k8s-from-scratch/rootfs}"
 POD_STATE_DIR="${POD_STATE_DIR:-/var/lib/k8s-from-scratch/pods}"
 NAMESPACE_DIR="${NAMESPACE_DIR:-/run/k8s-from-scratch}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+POLL_ATTEMPTS=50
+POLL_INTERVAL=0.1
+NETWORK_SIGNAL_TIMEOUT=5
+
 source "$SCRIPT_DIR/lib/namespace.sh"
 source "$SCRIPT_DIR/lib/json.sh"
 source "$SCRIPT_DIR/lib/validate.sh"
 source "$SCRIPT_DIR/lib/network.sh"
 
+runtime_error() {
+    printf 'runtime: %s\n' "$*" >&2
+}
+
+print_usage() {
+    printf 'Usage:\n' >&2
+    printf '  %s start <name> --ip <address> -- <command> [args...]\n' "$0" >&2
+    printf '  %s stop <name>\n' "$0" >&2
+    printf '  %s status <name>\n' "$0" >&2
+}
+
+validate_runtime_directories() {
+    local path
+
+    for path in "$POD_STATE_DIR" "$NAMESPACE_DIR" "$GLOBAL_ROOTFS"; do
+        if [[ "$path" != /* || "$path" == / ]]; then
+            runtime_error "Directory must be absolute and must not be /: $path"
+            return 1
+        fi
+    done
+}
+
+validate_pod_ip() {
+    local pod_ip="$1"
+    local last_octet
+
+    # The current network module supports only this subnet and pod range.
+    if [[ ! "$pod_ip" =~ ^10\.244\.0\.([0-9]{1,3})$ ]]; then
+        runtime_error "Expected a pod IP in 10.244.0.2-10.244.0.254: $pod_ip"
+        return 1
+    fi
+
+    last_octet="${BASH_REMATCH[1]}"
+
+    if [[ "$last_octet" == 0* ]] || ((10#$last_octet < 2 || 10#$last_octet > 254)); then
+        runtime_error "Expected a pod IP in 10.244.0.2-10.244.0.254: $pod_ip"
+        return 1
+    fi
+}
+
+lock_pod() {
+    local pod_name="$1"
+
+    # This file survives removal of the pod's directories.
+    mkdir -p -- "$NAMESPACE_DIR/.locks" || return 1
+
+    exec 9>"$NAMESPACE_DIR/.locks/$pod_name" || return 1
+    flock -x 9 || return 1
+}
+
+# Inspection: running means an init process has reached the pod rootfs.
+# It does not mean that the application or the network is ready.
 runtime_status() {
-    local name="$1" identity members pid role actual_root expected_root
-    identity=$(namespace_mount_identity "$NAMESPACE_DIR/$name/uts") || return 1
-    if [[ -z "$identity" ]]; then echo exited; return 0; fi
-    members=$(namespace_processes "$identity") || return 1
+    local pod_name="$1"
+    local uts_id
+    local members
+    local pid role
+    local other_pid other_role
+    local proc_root_id rootfs_id
+
+    uts_id=$(namespace_mount_identity "$NAMESPACE_DIR/$pod_name/uts") || return 1
+
+    if [[ -z "$uts_id" ]]; then
+        printf 'exited\n'
+        return 0
+    fi
+
+    members=$(namespace_processes "$uts_id") || return 1
+
     while read -r pid role; do
         [[ "$role" == init ]] || continue
-        # PID 1 must have reached chroot, not just the setup shell.
-        expected_root=$(namespace_identity "$POD_STATE_DIR/$name/rootfs") || return 1
-        if actual_root=$(namespace_identity "/proc/$pid/root" 2>/dev/null) &&
-           [[ "$actual_root" == "$expected_root" ]]; then
-            echo running
+
+        rootfs_id=$(namespace_identity "$POD_STATE_DIR/$pod_name/rootfs") || return 1
+
+        if ! proc_root_id=$(namespace_identity "/proc/$pid/root" 2>/dev/null); then
+            # Re-scan to distinguish a process that exited from an inspection error.
+            members=$(namespace_processes "$uts_id") || return 1
+
+            while read -r other_pid other_role; do
+                if [[ "$other_pid" == "$pid" && "$other_role" == init ]]; then
+                    runtime_error "Cannot inspect root directory of process $pid."
+                    return 1
+                fi
+            done <<< "$members"
+
+            continue
+        fi
+
+        if [[ "$proc_root_id" == "$rootfs_id" ]]; then
+            printf 'running\n'
             return 0
         fi
     done <<< "$members"
-    echo exited
+
+    printf 'exited\n'
 }
 
-runtime_release_namespace() {
-    local name="$1" identity members pid role current attempt
-    local ns_dir="$NAMESPACE_DIR/$name"
-    local fifo="$POD_STATE_DIR/$name/net-ready"
+# Stop processes before releasing the namespace references used to find them.
+stop_namespace_processes() {
+    local uts_id="$1"
+    local members
+    local pid role current_identity
+    local attempt
 
-    # Detach network before killing processes — the veth lives independently.
-    net_detach_pod "$name" || return 1
+    for ((attempt=0; attempt<POLL_ATTEMPTS; attempt++)); do
+        members=$(namespace_processes "$uts_id") || return 1
 
-    # Remove FIFO if the workload never consumed it (e.g. wiring failed).
-    [[ -p "$fifo" ]] && rm -f "$fifo"
+        if [[ -z "$members" ]]; then
+            return 0
+        fi
 
-    identity=$(namespace_mount_identity "$ns_dir/uts") || return 1
-    if [[ -n "$identity" ]]; then
-        # SIGKILL is deliberate: keep the project's force-stop semantics.
-        # Killing the wrapper also kills its child (--kill-child).
-        for ((attempt=0; attempt<50; attempt++)); do
-            members=$(namespace_processes "$identity") || return 1
-            [[ -n "$members" ]] || break
-            while read -r pid role; do
-                # Recheck immediately before signaling. A small PID-reuse race
-                # still exists; Bash does not provide pidfd-based signaling.
-                if ! current=$(namespace_identity "/proc/$pid/ns/uts" 2>/dev/null); then
-                    continue  # Next scan distinguishes exit from inspection failure.
-                fi
-                [[ "$current" == "$identity" ]] || continue
-                if ! kill -KILL "$pid" 2>/dev/null; then
-                    if current=$(namespace_identity "/proc/$pid/ns/uts" 2>/dev/null) &&
-                       [[ "$current" == "$identity" ]]; then
-                        echo "Cannot stop process $pid for pod '$name'." >&2
+        while read -r pid role; do
+            # Recheck ownership immediately before signaling; a PID-reuse race remains.
+            if ! current_identity=$(namespace_identity "/proc/$pid/ns/uts" 2>/dev/null); then
+                continue
+            fi
+
+            [[ "$current_identity" == "$uts_id" ]] || continue
+
+            if ! kill -KILL "$pid" 2>/dev/null; then
+                if current_identity=$(namespace_identity "/proc/$pid/ns/uts" 2>/dev/null); then
+                    if [[ "$current_identity" == "$uts_id" ]]; then
+                        runtime_error "Cannot stop process $pid."
                         return 1
                     fi
                 fi
-            done <<< "$members"
-            sleep 0.1
-        done
-        members=$(namespace_processes "$identity") || return 1
-        if [[ -n "$members" ]]; then
-            echo "Stop timed out for '$name'; resources retained." >&2
-            return 1
-        fi
-        umount -- "$ns_dir/uts" || return 1
-    fi
-    rm -f -- "$ns_dir/uts" || return 1
+            fi
+        done <<< "$members"
 
-    # Unmount net namespace handle if it is still mounted.
-    if findmnt -rn -M "$ns_dir/net" >/dev/null 2>&1; then
-        umount -- "$ns_dir/net" || return 1
+        sleep "$POLL_INTERVAL"
+    done
+
+    members=$(namespace_processes "$uts_id") || return 1
+
+    if [[ -n "$members" ]]; then
+        runtime_error 'Stopping processes timed out; namespace handles retained.'
+        return 1
     fi
-    rm -f -- "$ns_dir/net" || true
+}
+
+remove_namespace_handle() {
+    local ns_path="$1"
+    local ns_id
+
+    ns_id=$(namespace_mount_identity "$ns_path") || return 1
+
+    if [[ -n "$ns_id" ]]; then
+        umount -- "$ns_path" || return 1
+    fi
+
+    rm -f -- "$ns_path" || return 1
+}
+
+runtime_release_namespace() {
+    local pod_name="$1"
+    local ns_dir="$NAMESPACE_DIR/$pod_name"
+    local fifo_path="$POD_STATE_DIR/$pod_name/net-ready"
+    local uts_id
+
+    uts_id=$(namespace_mount_identity "$ns_dir/uts") || return 1
+
+    if [[ -n "$uts_id" ]]; then
+        stop_namespace_processes "$uts_id" || return 1
+    fi
+
+    net_detach_pod "$pod_name" || return 1
+
+    rm -f -- "$fifo_path" || return 1
+
+    remove_namespace_handle "$ns_dir/net" || return 1
+    remove_namespace_handle "$ns_dir/uts" || return 1
 
     if [[ -d "$ns_dir" ]]; then
         rmdir -- "$ns_dir" || return 1
@@ -84,140 +195,276 @@ runtime_release_namespace() {
 }
 
 runtime_stop() {
-    runtime_release_namespace "$1" || return 1
-    rm -rf -- "$POD_STATE_DIR/$1" || return 1
+    local pod_name="$1"
+
+    runtime_release_namespace "$pod_name" || return 1
+
+    # Explicit stop removes the writable filesystem and the previous log.
+    rm -rf -- "$POD_STATE_DIR/$pod_name" || return 1
 }
 
-runtime_start() {
-    local name="$1"
-    shift
-
-    # Parse --ip <addr> before --.
-    local pod_ip=""
-    while [[ $# -gt 0 && ${1:-} != -- ]]; do
-        case "$1" in
-            --ip) pod_ip="$2"; shift 2 ;;
-            *) echo "Unknown flag: $1" >&2; return 1 ;;
-        esac
-    done
-    [[ ${1:-} == -- ]] && shift
-    [[ $# -gt 0 ]] || { echo 'Missing workload command.' >&2; return 1; }
-    [[ -n "$pod_ip" ]] || { echo 'Missing --ip <address>.' >&2; return 1; }
-
-    local state started_at launcher attempt exit_code
-    local pod_dir="$POD_STATE_DIR/$name" ns_dir="$NAMESPACE_DIR/$name"
-    local ns_net_path="$ns_dir/net" fifo="$pod_dir/net-ready"
-
-    state=$(runtime_status "$name") || return 1
-    if [[ "$state" == running ]]; then
-        local existing_ip
-        existing_ip=$(net_read_pod_ip "$ns_net_path") || existing_ip=""
-        json_build_status running null null null "$pod_dir/log" "${existing_ip:-null}"
-        return 0
-    fi
+# Preparation creates ordinary mount targets, a rootfs copy and a synchronization FIFO.
+prepare_pod_files() {
+    local pod_name="$1"
+    local pod_dir="$POD_STATE_DIR/$pod_name"
+    local ns_dir="$NAMESPACE_DIR/$pod_name"
 
     ROOTFS="$GLOBAL_ROOTFS" validate_rootfs || return 1
-    runtime_stop "$name" || return 1
+
+    runtime_stop "$pod_name" || return 1
+
     mkdir -p -- "$pod_dir" "$ns_dir" || return 1
     touch -- "$ns_dir/uts" "$ns_dir/net" || return 1
+
     cp -a -- "$GLOBAL_ROOTFS" "$pod_dir/rootfs" || return 1
-    mkfifo "$fifo" || return 1
-    started_at=$(date +%s)
 
-    # Do not let the background workload inherit our per-pod flock or kubelet flock.
-    run_isolated "$name" "$ns_dir/uts" "$ns_net_path" "$fifo" "$pod_dir/rootfs" "$@" \
-        8>&- 9>&- </dev/null >"$pod_dir/log" 2>&1 &
-    launcher=$!
+    mkfifo -- "$pod_dir/net-ready" || return 1
+}
 
-    # Poll until the net namespace handle is a live nsfs mount.
-    local net_ready=0
-    for ((attempt=0; attempt<50; attempt++)); do
-        if ! kill -0 "$launcher" 2>/dev/null; then
-            break
+wait_for_network_namespace() {
+    local net_path="$1"
+    local launcher_pid="$2"
+    local net_id
+    local attempt
+
+    for ((attempt=0; attempt<POLL_ATTEMPTS; attempt++)); do
+        if ! kill -0 "$launcher_pid" 2>/dev/null; then
+            return 1
         fi
-        if namespace_mount_identity "$ns_net_path" >/dev/null 2>&1 && \
-           [[ -n "$(namespace_mount_identity "$ns_net_path")" ]]; then
-            net_ready=1
-            break
-        fi
-        sleep 0.1
-    done
 
-    if [[ $net_ready -eq 0 ]]; then
-        # Launcher died before the net namespace was ready.
-        if kill -0 "$launcher" 2>/dev/null; then
-            kill -KILL "$launcher" 2>/dev/null || true
-        fi
-        wait "$launcher" 2>/dev/null || true
-        echo "Net namespace handle not ready for '$name'; log: $pod_dir/log" >&2
-        runtime_release_namespace "$name" || true
-        return 1
-    fi
+        net_id=$(namespace_mount_identity "$net_path") || return 1
 
-    # Wire the network. On failure, close the FIFO (sending EOF) to unblock the
-    # wrapper so it exits, then clean up.
-    if ! net_ensure_bridge || ! net_attach_pod "$name" "$ns_net_path" "$pod_ip"; then
-        echo "Network wiring failed for '$name'." >&2
-        # Close FIFO: wrapper gets EOF and exits non-zero.
-        exec {fd}<>"$fifo" && exec {fd}>&-
-        rm -f "$fifo"
-        wait "$launcher" 2>/dev/null || true
-        runtime_release_namespace "$name" || true
-        return 1
-    fi
-
-    # Signal the workload: networking is ready.
-    printf 'x' > "$fifo"
-
-    # Wait for the workload to reach chroot (state == running).
-    for ((attempt=0; attempt<50; attempt++)); do
-        if ! state=$(runtime_status "$name"); then
-            break
-        fi
-        if [[ "$state" == running ]]; then
-            json_build_status running "$started_at" null null "$pod_dir/log" "$pod_ip"
+        if [[ -n "$net_id" ]]; then
             return 0
         fi
-        if ! kill -0 "$launcher" 2>/dev/null; then
-            exit_code=0
-            wait "$launcher" || exit_code=$?
-            runtime_release_namespace "$name" || return 1
-            json_build_status exited "$started_at" "$(date +%s)" "$exit_code" "$pod_dir/log" null
-            return 0
-        fi
-        sleep 0.1
+
+        sleep "$POLL_INTERVAL"
     done
 
-    # Cancel the still-owned launch process before removing anything it may use.
-    if kill -0 "$launcher" 2>/dev/null; then
-        kill -KILL "$launcher" || return 1
-    fi
-    wait "$launcher" 2>/dev/null || true
-    echo "Startup failed or timed out for '$name'; log: $pod_dir/log" >&2
-    runtime_release_namespace "$name" || return 1
     return 1
 }
 
-main() {
-    [[ $# -ge 2 ]] || {
-        echo "Usage: $0 start <name> [--ip <addr>] -- <command> [args...]" >&2
-        echo "       $0 stop <name>" >&2
-        echo "       $0 status <name>" >&2
+signal_network_ready() {
+    local fifo_path="$1"
+
+    if [[ ! -p "$fifo_path" ]]; then
+        runtime_error "Missing network readiness FIFO: $fifo_path"
         return 1
-    }
-    local action="$1" name="$2" path
-    shift 2
-    validate_name "$name" || return 1
-    [[ $EUID -eq 0 ]] || { echo 'Runtime requires root.' >&2; return 1; }
-    case "$action" in start|stop|status) ;; *) echo "Unknown action: $action" >&2; return 1 ;; esac
-    for path in "$POD_STATE_DIR" "$NAMESPACE_DIR" "$GLOBAL_ROOTFS"; do
-        [[ "$path" == /* && "$path" != / ]] || return 1
+    fi
+
+    # A dead reader must not leave runtime blocked forever when opening the FIFO.
+    timeout --kill-after=1 "$NETWORK_SIGNAL_TIMEOUT" \
+        /bin/bash -c 'printf x > "$1"' network-ready "$fifo_path" 9>&-
+}
+
+cancel_pod_start() {
+    local pod_name="$1"
+    local launcher_pid="$2"
+
+    # Kill our launch process first; unshare --kill-child also kills its child.
+    # Do not rely on opening/closing a FIFO to wake a reader during failure cleanup.
+    if kill -0 "$launcher_pid" 2>/dev/null; then
+        kill -KILL "$launcher_pid" 2>/dev/null || true
+    fi
+
+    wait "$launcher_pid" 2>/dev/null || true
+
+    # Preserve rootfs/log for diagnosis. A later start or explicit stop removes them.
+    runtime_release_namespace "$pod_name" || return 1
+}
+
+wait_for_workload_start() {
+    local pod_name="$1"
+    local pod_ip="$2"
+    local launcher_pid="$3"
+    local started_at="$4"
+    local log_path="$POD_STATE_DIR/$pod_name/log"
+    local observed_state exit_code exited_at
+    local attempt
+
+    for ((attempt=0; attempt<POLL_ATTEMPTS; attempt++)); do
+        observed_state=$(runtime_status "$pod_name") || return 1
+
+        if [[ "$observed_state" == running ]]; then
+            json_build_status running "$started_at" null null "$log_path" "$pod_ip"
+            return $?
+        fi
+
+        if ! kill -0 "$launcher_pid" 2>/dev/null; then
+            exit_code=0
+            wait "$launcher_pid" || exit_code=$?
+
+            runtime_release_namespace "$pod_name" || return 1
+            exited_at=$(date +%s) || return 1
+
+            json_build_status exited "$started_at" "$exited_at" "$exit_code" "$log_path" null
+            return $?
+        fi
+
+        sleep "$POLL_INTERVAL"
     done
-    # Lock files live outside the per-pod directory that stop removes.
-    mkdir -p "$NAMESPACE_DIR/.locks" || return 1
-    exec 9>"$NAMESPACE_DIR/.locks/$name" || return 1
-    flock -x 9 || return 1
-    "runtime_$action" "$name" "$@"
+
+    return 1
+}
+
+# Start orchestration: validate, prepare, launch, wire networking, release the workload.
+runtime_start() {
+    local pod_name="$1"
+    shift
+
+    local pod_ip=""
+
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        case "$1" in
+            --ip)
+                if [[ $# -lt 2 || "$2" == -- ]]; then
+                    runtime_error 'Missing address after --ip.'
+                    return 1
+                fi
+
+                if [[ -n "$pod_ip" ]]; then
+                    runtime_error 'Pass --ip only once.'
+                    return 1
+                fi
+
+                pod_ip="$2"
+                shift 2
+                ;;
+
+            *)
+                runtime_error "Unknown start option: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ ${1:-} != -- ]]; then
+        runtime_error 'Expected -- before the workload command.'
+        return 1
+    fi
+
+    shift
+
+    if [[ $# -eq 0 || -z "$1" ]]; then
+        runtime_error 'Missing workload command.'
+        return 1
+    fi
+
+    validate_pod_ip "$pod_ip" || return 1
+
+    local pod_dir="$POD_STATE_DIR/$pod_name"
+    local ns_dir="$NAMESPACE_DIR/$pod_name"
+    local net_path="$ns_dir/net"
+    local fifo_path="$pod_dir/net-ready"
+    local observed_state existing_ip started_at launcher_pid
+
+    observed_state=$(runtime_status "$pod_name") || return 1
+
+    if [[ "$observed_state" == running ]]; then
+        existing_ip=$(net_read_pod_ip "$net_path") || return 1
+
+        # Do not silently report success for an existing pod with a different/missing IP.
+        if [[ "$existing_ip" != "$pod_ip" ]]; then
+            runtime_error "Pod '$pod_name' is running, but its observed IP '${existing_ip:-missing}' differs from '$pod_ip'."
+            return 1
+        fi
+
+        json_build_status running null null null "$pod_dir/log" "$existing_ip"
+        return $?
+    fi
+
+    if ! prepare_pod_files "$pod_name"; then
+        runtime_error "Cannot prepare files for '$pod_name'."
+        return 1
+    fi
+
+    started_at=$(date +%s) || return 1
+
+    # Keep the workload independent of our per-pod lock and terminal input.
+    run_isolated "$pod_name" \
+        "$ns_dir/uts" "$net_path" \
+        "$fifo_path" "$pod_dir/rootfs" "$@" \
+        9>&- </dev/null >"$pod_dir/log" 2>&1 &
+
+    launcher_pid=$!
+
+    if ! wait_for_network_namespace "$net_path" "$launcher_pid"; then
+        runtime_error "Network namespace not ready for '$pod_name'; see $pod_dir/log."
+        cancel_pod_start "$pod_name" "$launcher_pid" || return 1
+        return 1
+    fi
+
+    if ! net_ensure_bridge || ! net_attach_pod "$pod_name" "$net_path" "$pod_ip"; then
+        runtime_error "Network setup failed for '$pod_name'; see $pod_dir/log."
+        cancel_pod_start "$pod_name" "$launcher_pid" || return 1
+        return 1
+    fi
+
+    if ! signal_network_ready "$fifo_path"; then
+        runtime_error "Cannot signal network readiness for '$pod_name'."
+        cancel_pod_start "$pod_name" "$launcher_pid" || return 1
+        return 1
+    fi
+
+    if ! wait_for_workload_start "$pod_name" "$pod_ip" "$launcher_pid" "$started_at"; then
+        runtime_error "Startup failed or timed out for '$pod_name'; see $pod_dir/log."
+        cancel_pod_start "$pod_name" "$launcher_pid" || return 1
+        return 1
+    fi
+}
+
+# Command-line entry point
+main() {
+    if [[ $# -lt 2 ]]; then
+        print_usage
+        return 1
+    fi
+
+    local action="$1"
+    local pod_name="$2"
+    shift 2
+
+    validate_name "$pod_name" || return 1
+
+    if [[ $EUID -ne 0 ]]; then
+        runtime_error 'Run as root inside the development container.'
+        return 1
+    fi
+
+    validate_runtime_directories || return 1
+
+    case "$action" in
+        start)
+            lock_pod "$pod_name" || return 1
+            runtime_start "$pod_name" "$@"
+            ;;
+
+        stop)
+            if [[ $# -ne 0 ]]; then
+                print_usage
+                return 1
+            fi
+
+            lock_pod "$pod_name" || return 1
+            runtime_stop "$pod_name"
+            ;;
+
+        status)
+            if [[ $# -ne 0 ]]; then
+                print_usage
+                return 1
+            fi
+
+            lock_pod "$pod_name" || return 1
+            runtime_status "$pod_name"
+            ;;
+
+        *)
+            runtime_error "Unknown action: $action"
+            print_usage
+            return 1
+            ;;
+    esac
 }
 
 main "$@"

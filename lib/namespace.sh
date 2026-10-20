@@ -7,7 +7,9 @@ namespace_identity() {
 }
 
 namespace_mount_identity() {
-    local path="$1" fs rc
+    local path="$1"
+    local fs rc
+
     if fs=$(findmnt -rn -M "$path" -o FSTYPE); then
         if [[ "$fs" != nsfs ]]; then
             echo "Unexpected filesystem at namespace target: $path ($fs)" >&2
@@ -25,8 +27,10 @@ namespace_mount_identity() {
 namespace_processes() {
     # Output: outer PID, followed by 'init' or 'member'.
     # Empty output is a successful inspection with no live members.
-    local identity="$1" path pid current status key value state
+    local ns_id="$1"
+    local path pid current status key value state
     local outer_ids=() ids=()
+
     while read -r key value; do
         [[ "$key" != NSpid: ]] || read -ra outer_ids <<< "$value"
     done < /proc/self/status
@@ -40,18 +44,27 @@ namespace_processes() {
             echo "Cannot inspect process $pid" >&2
             return 1
         fi
-        state=""; ids=()
+        state=""
+        ids=()
+
         while read -r key value; do
             case "$key" in
-                State:) state=${value%% *} ;;
-                NSpid:) read -ra ids <<< "$value" ;;
+                State:)
+                    state=${value%% *}
+                    ;;
+                NSpid:)
+                    read -ra ids <<< "$value"
+                    ;;
             esac
         done <<< "$status"
         [[ "$state" == Z || "$state" == X ]] && continue
 
         if ! current=$(namespace_identity "$path" 2>/dev/null); then
             # A process can exit between reading status and reading its namespace.
-            if [[ ! -d "/proc/$pid" ]]; then continue; fi
+            if [[ ! -d "/proc/$pid" ]]; then
+                continue
+            fi
+
             if status=$(cat "/proc/$pid/status" 2>/dev/null) &&
                [[ "$status" =~ State:[[:space:]]+[ZX] ]]; then
                 continue
@@ -59,7 +72,7 @@ namespace_processes() {
             echo "Cannot read UTS namespace for process $pid" >&2
             return 1
         fi
-        [[ "$current" == "$identity" ]] || continue
+        [[ "$current" == "$ns_id" ]] || continue
         if [[ ${#ids[@]} -eq $((${#outer_ids[@]} + 1)) &&
               ${ids[${#ids[@]}-1]} == 1 ]]; then
             printf '%s init\n' "$pid"
@@ -70,20 +83,31 @@ namespace_processes() {
 }
 
 run_isolated() {
-    local container_name="$1" ns_uts_path="$2" ns_net_path="$3" fifo_path="$4" rootfs="$5"
+    local pod_name="$1" uts_path="$2" net_path="$3"
+    local fifo_path="$4" rootfs="$5"
     shift 5
-    exec unshare "--uts=$ns_uts_path" "--net=$ns_net_path" --pid --fork --kill-child --mount -- \
+
+    exec unshare \
+        "--uts=$uts_path" \
+        "--net=$net_path" \
+        --pid --fork --kill-child --mount -- \
         /bin/bash -c '
             set -euo pipefail
-            rootfs="$1"; container_name="$2"; fifo_path="$3"
+
+            rootfs="$1"
+            pod_name="$2"
+            fifo_path="$3"
             shift 3
-            hostname "$container_name"
+
+            hostname "$pod_name"
             mount --make-rprivate /
             mount -t proc proc "$rootfs/proc"
-            # Block until the host signals that networking is wired.
-            # EOF (host closed without writing — wiring failed) exits non-zero.
+
+            # Wait for the runtime to finish network setup.
+            # The runtime terminates this launcher if setup fails.
             read -r -N 1 _ < "$fifo_path" || exit 1
             rm -f "$fifo_path"
+
             exec chroot "$rootfs" "$@"
-        ' container-init "$rootfs" "$container_name" "$fifo_path" "$@"
+        ' container-init "$rootfs" "$pod_name" "$fifo_path" "$@"
 }

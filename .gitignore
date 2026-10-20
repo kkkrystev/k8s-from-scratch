@@ -3,3 +3,4 @@ tests
 claude-misc
 .DS_Store
 reset.sh
+logs
