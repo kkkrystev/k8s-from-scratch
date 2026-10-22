@@ -1,12 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-ETCD_DIR="/var/lib/k8s-from-scratch/etcd"
+ETCD_ENDPOINT="${ETCD_ENDPOINT:-127.0.0.1:2379}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/etcd-client.sh"
 
 usage() {
     echo "Usage:"
+    echo "  $0 health"
     echo "  $0 put <key> <value>   # write a value"
     echo "  $0 get <key>           # read a value"
     echo "  $0 delete <key>        # remove a key"
@@ -23,6 +24,7 @@ main() {
     shift
 
     case "$action" in
+        health) etcd_health ;;
         put)
             if [[ $# -lt 2 ]]; then
                 echo "Usage: $0 put <key> <value>" >&2
@@ -35,9 +37,11 @@ main() {
                 echo "Usage: $0 get <key>" >&2
                 return 1
             fi
-            if ! etcd_get "$1"; then
-                echo "Key not found: $1" >&2
-                return 1
+            local rc
+            if etcd_get "$1"; then :; else
+                rc=$?
+                [[ "$rc" != 2 ]] || echo "Key not found: $1" >&2
+                return "$rc"
             fi
             echo
             ;;

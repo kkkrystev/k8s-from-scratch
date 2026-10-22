@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/validate.sh"
+source "$SCRIPT_DIR/lib/etcd-store.sh"
+export LC_ALL=C
+export ETCD_DIR="${ETCD_DIR:-/var/lib/k8s-from-scratch/etcd-server}"
+export ETCD_READ_TIMEOUT="${ETCD_READ_TIMEOUT:-3}"
+[[ "$ETCD_DIR" == /* && "$ETCD_READ_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || exit 1
+if [[ ${1:-} == --handle && $# -eq 1 ]]; then
+    flock -n 8 2>/dev/null || exit 1
+    if ! IFS= read -r -t "$ETCD_READ_TIMEOUT" -n 65537 request; then
+        store_error incomplete_request
+    elif ((${#request} > 65536)); then
+        store_error request_too_large
+    else
+        store_dispatch "$request"
+    fi
+    exit
+fi
+[[ $# -eq 0 ]] || { echo "Usage: $0 (configured by ETCD_DIR, ETCD_BIND, ETCD_PORT)" >&2; exit 1; }
+bind="${ETCD_BIND:-127.0.0.1}"
+port="${ETCD_PORT:-2379}"
+[[ "$bind" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || exit 1
+for cmd in jq socat flock setpriv; do command -v "$cmd" >/dev/null || { echo "Missing: $cmd" >&2; exit 1; }; done
+umask 077
+mkdir -p -- "$ETCD_DIR"
+exec 8>"$ETCD_DIR/server.lock"
+flock -n 8 || { echo 'Storage already in use.' >&2; exit 1; }
+if [[ ! -e "$ETCD_DIR/state.json" ]]; then
+    # Refuse implicit migration or silent disregard of an older filesystem store.
+    [[ -z "$(find "$ETCD_DIR" -mindepth 1 ! -name server.lock -print -quit)" ]] || {
+        echo 'Use a fresh ETCD_DIR for this storage format.' >&2; exit 1;
+    }
+    store_commit '{"version":1,"keys":{}}'
+fi
+store_load >/dev/null || { echo 'Invalid storage; data retained.' >&2; exit 1; }
+child=''
+cleanup() {
+    trap - EXIT INT TERM
+    if [[ -n "$child" ]]; then kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cd -- "$SCRIPT_DIR"
+printf 'Storage listening on %s:%s\n' "$bind" "$port" >&2
+while true; do
+    setpriv --pdeathsig TERM socat "TCP4-LISTEN:$port,bind=$bind,reuseaddr" 'EXEC:bash ./etcdd --handle,nofork' &
+    child=$!
+    if wait "$child"; then rc=0; else rc=$?; fi
+    child=''
+    ((rc == 0)) || exit "$rc"
+done

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ETCD_DIR="${ETCD_DIR:-/var/lib/k8s-from-scratch/etcd}"
+ETCD_ENDPOINT="${ETCD_ENDPOINT:-127.0.0.1:2379}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/validate.sh"
@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/lib/delete.sh"
 
 usage() {
     echo "Usage:"
-    echo "  $0 create <name> <command> [args...]   # declare a pod (kubelet will start it)"
+    echo "  $0 create --node <node> <name> <command> [args...]   # declare a pod (kubelet will start it)"
     echo "  $0 list                                # list all pods"
     echo "  $0 get <name>                          # show pod details"
     echo "  $0 delete <name> [name ...]            # mark pods for deletion"
