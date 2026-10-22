@@ -4,3 +4,4 @@ claude-misc
 .DS_Store
 reset.sh
 logs
+reset-emergency.sh
