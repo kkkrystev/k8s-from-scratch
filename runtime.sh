@@ -15,7 +15,7 @@ NETWORK_SIGNAL_TIMEOUT=5
 source "$SCRIPT_DIR/lib/namespace.sh"
 source "$SCRIPT_DIR/lib/json.sh"
 source "$SCRIPT_DIR/lib/validate.sh"
-source "$SCRIPT_DIR/lib/network.sh"
+source "$SCRIPT_DIR/lib/network-client.sh"
 
 runtime_error() {
     printf 'runtime: %s\n' "$*" >&2
@@ -23,8 +23,9 @@ runtime_error() {
 
 print_usage() {
     printf 'Usage:\n' >&2
-    printf '  %s start <name> --ip <address> -- <command> [args...]\n' "$0" >&2
+    printf '  %s start <name> --ip <address> --prefix <length> --gateway <address> -- <command> [args...]\n' "$0" >&2
     printf '  %s stop <name>\n' "$0" >&2
+    printf '  %s ip <name>\n' "$0" >&2
     printf '  %s status <name>\n' "$0" >&2
 }
 
@@ -39,22 +40,34 @@ validate_runtime_directories() {
     done
 }
 
-validate_pod_ip() {
-    local pod_ip="$1"
-    local last_octet
+# Keep validation aligned with the current IPAM contract: /24, gateway .1.
+validate_network_config() {
+    local address octet
+    local -a octets
 
-    # The current network module supports only this subnet and pod range.
-    if [[ ! "$pod_ip" =~ ^10\.244\.0\.([0-9]{1,3})$ ]]; then
-        runtime_error "Expected a pod IP in 10.244.0.2-10.244.0.254: $pod_ip"
-        return 1
-    fi
+    for address in "$1" "$3"; do
+        [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        IFS=. read -r -a octets <<< "$address"
 
-    last_octet="${BASH_REMATCH[1]}"
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+            ((10#$octet <= 255)) || return 1
+        done
+    done
 
-    if [[ "$last_octet" == 0* ]] || ((10#$last_octet < 2 || 10#$last_octet > 254)); then
-        runtime_error "Expected a pod IP in 10.244.0.2-10.244.0.254: $pod_ip"
-        return 1
-    fi
+    [[ "$2" == 24 && "$3" == "${1%.*}.1" ]] || return 1
+    octet="${1##*.}"
+    ((10#$octet >= 2 && 10#$octet <= 254))
+}
+
+runtime_pod_ip() {
+    local addresses
+    addresses=$(nsenter --net="$NAMESPACE_DIR/$1/net" ip -j -4 addr show dev eth0) || return 1
+
+    jq -er '
+        [.[].addr_info[] | select(.family == "inet") | .local] |
+        if length == 1 then .[0] else error("Expected one Pod IPv4 address") end
+    ' <<< "$addresses"
 }
 
 lock_pod() {
@@ -182,7 +195,10 @@ runtime_release_namespace() {
         stop_namespace_processes "$uts_id" || return 1
     fi
 
-    net_detach_pod "$pod_name" || return 1
+    if ! network_detach "$pod_name" >&2; then
+        runtime_error "Detach failed for '$pod_name'; namespace handles retained."
+        return 1
+    fi
 
     rm -f -- "$fifo_path" || return 1
 
@@ -312,22 +328,32 @@ runtime_start() {
     local pod_name="$1"
     shift
 
-    local pod_ip=""
+    local pod_ip="" prefix="" gateway="" config option
 
     while [[ $# -gt 0 && "$1" != -- ]]; do
         case "$1" in
-            --ip)
+            --ip|--prefix|--gateway)
+                option="$1"
+
                 if [[ $# -lt 2 || "$2" == -- ]]; then
-                    runtime_error 'Missing address after --ip.'
+                    runtime_error "Missing value after $option."
                     return 1
                 fi
 
-                if [[ -n "$pod_ip" ]]; then
-                    runtime_error 'Pass --ip only once.'
-                    return 1
-                fi
-
-                pod_ip="$2"
+                case "$option" in
+                    --ip)
+                        [[ -z "$pod_ip" ]] || { runtime_error "Duplicate --ip."; return 1; }
+                        pod_ip="$2"
+                        ;;
+                    --prefix)
+                        [[ -z "$prefix" ]] || { runtime_error "Duplicate --prefix."; return 1; }
+                        prefix="$2"
+                        ;;
+                    --gateway)
+                        [[ -z "$gateway" ]] || { runtime_error "Duplicate --gateway."; return 1; }
+                        gateway="$2"
+                        ;;
+                esac
                 shift 2
                 ;;
 
@@ -350,7 +376,13 @@ runtime_start() {
         return 1
     fi
 
-    validate_pod_ip "$pod_ip" || return 1
+    if ! validate_network_config "$pod_ip" "$prefix" "$gateway"; then
+        runtime_error 'Expected a /24 Pod address (.2-.254) and gateway .1 in the same subnet.'
+        return 1
+    fi
+
+    config=$(jq -cn --arg ip "$pod_ip" --argjson prefix "$prefix" --arg gateway "$gateway" \
+        '{ip:$ip,prefix:$prefix,gateway:$gateway}') || return 1
 
     local pod_dir="$POD_STATE_DIR/$pod_name"
     local ns_dir="$NAMESPACE_DIR/$pod_name"
@@ -361,13 +393,16 @@ runtime_start() {
     observed_state=$(runtime_status "$pod_name") || return 1
 
     if [[ "$observed_state" == running ]]; then
-        existing_ip=$(net_read_pod_ip "$net_path") || return 1
+        existing_ip=$(runtime_pod_ip "$pod_name") || return 1
 
         # Do not silently report success for an existing pod with a different/missing IP.
         if [[ "$existing_ip" != "$pod_ip" ]]; then
             runtime_error "Pod '$pod_name' is running, but its observed IP '${existing_ip:-missing}' differs from '$pod_ip'."
             return 1
         fi
+
+        # Let Provisioner verify the existing attachment and requested configuration.
+        network_attach "$pod_name" "$net_path" "$config" >&2 || return 1
 
         json_build_status running null null null "$pod_dir/log" "$existing_ip"
         return $?
@@ -394,7 +429,7 @@ runtime_start() {
         return 1
     fi
 
-    if ! net_ensure_bridge || ! net_attach_pod "$pod_name" "$net_path" "$pod_ip"; then
+    if ! network_attach "$pod_name" "$net_path" "$config" >&2; then
         runtime_error "Network setup failed for '$pod_name'; see $pod_dir/log."
         cancel_pod_start "$pod_name" "$launcher_pid" || return 1
         return 1
@@ -447,6 +482,12 @@ main() {
 
             lock_pod "$pod_name" || return 1
             runtime_stop "$pod_name"
+            ;;
+
+        ip)
+            [[ $# -eq 0 ]] || { print_usage; return 1; }
+            lock_pod "$pod_name" || return 1
+            runtime_pod_ip "$pod_name"
             ;;
 
         status)
