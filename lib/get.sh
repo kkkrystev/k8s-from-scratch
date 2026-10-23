@@ -2,13 +2,16 @@
 
 cmd_get() {
     [[ $# -eq 1 ]] || { echo "Usage: $0 get <name>" >&2; return 1; }
-    local name="$1" status state started exited code log pod_ip
+    local name="$1" spec rc node status state started exited code log pod_ip
     validate_name "$name" || return 1
-    if ! etcd_get "pods/$name/spec" >/dev/null; then
-        echo "Pod '$name' not found." >&2
-        return 1
+    if spec=$(etcd_get "pods/$name/spec"); then :; else
+        rc=$?
+        [[ "$rc" != 2 ]] || echo "Pod '$name' not found." >&2
+        return "$rc"
     fi
-    status=$(etcd_get "pods/$name/status") || status=""
+    node=$(jq -r '.node_name' <<< "$spec") || return 1
+    status=$(etcd_get_optional "pods/$name/status") || return 1
+    printf 'Node:      %s\n' "$node"
     state=$(json_get_field "$status" state) || return 1
     started=$(json_get_field "$status" started_at) || return 1
     exited=$(json_get_field "$status" exited_at) || return 1

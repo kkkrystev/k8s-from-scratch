@@ -1,26 +1,12 @@
-# Expects ETCD_DIR to be set and etcd-client.sh / json.sh / validate.sh sourced.
-
 create_pod() {
-    if [[ $# -lt 2 ]]; then
-        echo "Usage: $0 create <name> <command> [args...]" >&2
+    if [[ $# -lt 4 || $1 != --node ]]; then
+        echo "Usage: $0 create --node <node> <name> <command> [args...]" >&2
         return 1
     fi
-
-    local pod_name="$1"
-    shift
-
-    validate_name "$pod_name" || return 1
-
-    if etcd_get "pods/${pod_name}/spec" >/dev/null 2>&1; then
-        echo "Pod '$pod_name' already exists." >&2
-        return 1
-    fi
-    
-    # Metadata without a spec belongs to no declared pod.
-    etcd_delete "pods/${pod_name}/status" || return 1
-    etcd_delete "pods/${pod_name}/deleting" || return 1
-    local spec
-    spec=$(json_build_spec "$pod_name" "$@") || return 1
-    etcd_put "pods/${pod_name}/spec" "$spec" || return 1
-    echo "Pod '$pod_name' created."
+    local node="$2" pod_name="$3" spec
+    shift 3
+    validate_name "$node" && validate_name "$pod_name" || return 1
+    spec=$(json_build_spec "$pod_name" "$@" | jq -c --arg node "$node" '. + {node_name:$node}') || return 1
+    etcd_create_pod "$spec" || return 1
+    echo "Pod '$pod_name' created on '$node'."
 }

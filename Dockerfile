@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     bash \
     coreutils \
     jq \
+    socat \
     util-linux \
     procps \
     iproute2 \
