@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+[[ $# -ge 1 && $# -le 2 ]] || { echo "Usage: $0 cluster.json [output-directory]" >&2; exit 1; }
+input="$1"; output="${2:-config/generated}"
+# Validate the complete topology before writing any files.
+cluster=$(jq -cse '
+ def name: type == "string" and length <= 63 and test("^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$");
+ def ip: type == "string" and (split(".") as $p | ($p|length)==4 and
+   all($p[]; test("^(0|[1-9][0-9]{0,2})$") and tonumber<=255));
+ def subnet: type == "string" and endswith(".0/24") and (split("/")[0]|ip);
+ def path: type == "string" and startswith("/") and test("^[^\\s]+$");
+ select(length==1) | .[0] |
+ select(keys == ["defaults","storage","workers"]) |
+ select(.storage | keys == ["bind","dir","endpoint","name","port"] and
+   (.name|name) and (.bind|ip) and (.dir|path) and
+   (.endpoint|type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9.-]*:[1-9][0-9]{0,4}$")) and
+   (.port|type=="string" and test("^[1-9][0-9]{0,4}$") and tonumber<=65535)) |
+ select((.storage.endpoint | split(":")[-1]) == .storage.port) |
+ select(.defaults | type=="object" and all(.[]; type=="string" and (explode|all(.[]; .!=0 and .!=10 and .!=13)))) |
+ select(.workers | type=="array" and length>0 and all(.[];
+   keys==["ip","name","subnet"] and (.name|name) and (.ip|ip) and (.subnet|subnet))) |
+ select(([.workers[].name,.storage.name]|length)==([.workers[].name,.storage.name]|unique|length)) |
+ select(([.workers[].ip]|length)==([.workers[].ip]|unique|length)) |
+ select(([.workers[].subnet]|length)==([.workers[].subnet]|unique|length)) |
+ select(. as $c | all(.workers[]; .ip as $ip |
+   all($c.workers[]; (.subnet|split(".")[0:3]) != ($ip|split(".")[0:3]))))
+' "$input") || { echo 'Invalid topology: check fields, unique names/IPs/subnets and overlapping Node IPs.' >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source "$root/lib/node-config.sh"
+mkdir -p -- "$output"
+tmp=$(mktemp -d "$output/.generate.XXXXXX")
+trap 'rm -rf -- "$tmp"' EXIT
+while IFS= read -r name; do
+    config=$(jq -c --arg name "$name" '
+      . as $c | .workers[] | select(.name==$name) | . as $w |
+      $c.defaults + {NODE_ROLE:"worker",NODE_NAME:$w.name,NODE_IP:$w.ip,
+        POD_SUBNET:$w.subnet,ETCD_ENDPOINT:$c.storage.endpoint,
+        NET_ROUTES:([$c.workers[] | select(.name!=$name) | {key:.subnet,value:.ip}] | from_entries | tojson)}
+    ' <<< "$cluster")
+    jq -r 'to_entries | sort_by(.key)[] | "\(.key)=\(.value)"' <<< "$config" > "$tmp/$name.env"
+    node_config "$tmp/$name.env" >/dev/null
+ done < <(jq -r '.workers[].name' <<< "$cluster")
+name=$(jq -r '.storage.name' <<< "$cluster")
+jq -r '.storage as $s | {NODE_ROLE:"storage",NODE_NAME:$s.name,ETCD_ENDPOINT:$s.endpoint,
+  ETCD_BIND:$s.bind,ETCD_PORT:$s.port,ETCD_DIR:$s.dir,LOG_DIR:(.defaults.LOG_DIR // "/var/log/kfs")} |
+  to_entries | sort_by(.key)[] | "\(.key)=\(.value)"' <<< "$cluster" > "$tmp/$name.env"
+node_config "$tmp/$name.env" >/dev/null
+# Refuse to overwrite hand-edited configs. Generate to a new directory for changes.
+for file in "$tmp"/*.env; do
+    dest="$output/${file##*/}"
+    [[ ! -e "$dest" && ! -L "$dest" ]] || cmp -s -- "$file" "$dest" || {
+        echo "Different file exists: $dest. Generate into a new directory and review the diff." >&2; exit 1;
+    }
+done
+for file in "$tmp"/*.env; do
+    dest="$output/${file##*/}"
+    if [[ ! -e "$dest" ]]; then mv -- "$file" "$dest"; chmod 644 "$dest"; fi
+    printf '%s\n' "$dest"
+done

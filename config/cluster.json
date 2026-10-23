@@ -1,0 +1,17 @@
+{
+  "storage": {"name": "storage", "endpoint": "kfs-etcd:2379", "bind": "0.0.0.0", "port": "2379", "dir": "/var/lib/k8s-from-scratch/etcd-server"},
+  "defaults": {
+    "NET_BRIDGE": "kfsdemo0",
+    "IPAM_SOCKET": "/tmp/kfs-network/ipam.sock",
+    "NETWORK_SOCKET": "/tmp/kfs-network/network.sock",
+    "IPAM_STATE": "/var/lib/kfs-network-demo/ipam.json",
+    "NAMESPACE_DIR": "/run/kfs-network-demo",
+    "POD_STATE_DIR": "/var/lib/kfs-runtime-demo/pods",
+    "ROOTFS": "/var/lib/k8s-from-scratch/rootfs",
+    "LOG_DIR": "/var/log/kfs"
+  },
+  "workers": [
+    {"name": "node01", "ip": "172.29.240.11", "subnet": "10.245.1.0/24"},
+    {"name": "node02", "ip": "172.29.240.12", "subnet": "10.245.2.0/24"}
+  ]
+}

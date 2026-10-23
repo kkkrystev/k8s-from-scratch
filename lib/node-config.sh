@@ -1,0 +1,48 @@
+# .env is data: KEY=value, no shell expansion, quoting, eval or source.
+node_config() {
+    local file="$1" line key value config='{}'
+    [[ -f "$file" ]] || { echo "Config not found: $file" >&2; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* && "$line" != *$'\r'* ]] || { echo 'Expected KEY=value, LF line endings.' >&2; return 1; }
+        key=${line%%=*}; value=${line#*=}
+        case "$key" in
+            NODE_ROLE|NODE_NAME|NODE_IP|POD_SUBNET|NET_BRIDGE|NET_ROUTES|ETCD_ENDPOINT|ETCD_BIND|ETCD_PORT|ETCD_DIR|IPAM_SOCKET|NETWORK_SOCKET|IPAM_STATE|NAMESPACE_DIR|POD_STATE_DIR|ROOTFS|LOG_DIR|RECONCILE_INTERVAL) ;;
+            *) echo "Unknown setting: $key" >&2; return 1 ;;
+        esac
+        if jq -e --arg k "$key" 'has($k)' <<< "$config" >/dev/null; then
+            echo "Duplicate setting: $key" >&2; return 1
+        fi
+        config=$(jq -c --arg k "$key" --arg v "$value" '.[$k]=$v' <<< "$config") || return 1
+    done < "$file"
+    config=$(jq -c '
+      {NET_BRIDGE:"kfs0",NET_ROUTES:"{}",IPAM_SOCKET:"/run/k8s-from-scratch/ipam.sock",
+       NETWORK_SOCKET:"/run/k8s-from-scratch/network.sock",IPAM_STATE:"/var/lib/k8s-from-scratch/ipam/state.json",
+       NAMESPACE_DIR:"/run/k8s-from-scratch",POD_STATE_DIR:"/var/lib/k8s-from-scratch/pods",
+       ROOTFS:"/var/lib/k8s-from-scratch/rootfs",LOG_DIR:"/var/log/kfs",RECONCILE_INTERVAL:"5",
+       ETCD_BIND:"127.0.0.1",ETCD_PORT:"2379",ETCD_DIR:"/var/lib/k8s-from-scratch/etcd-server"} + . |
+      if .NODE_ROLE=="worker" then . + {IPAM_SUBNET:.POD_SUBNET,NET_SUBNET:.POD_SUBNET,NETNS_DIR:.NAMESPACE_DIR}
+      else . end | . + {KUBELET_LOG:(.LOG_DIR+"/kubelet.log")}
+    ' <<< "$config") || return 1
+    jq -e '
+      def name: type=="string" and length<=63 and test("^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$");
+      def ip: type=="string" and (split(".") as $p | ($p|length)==4 and all($p[];
+        test("^(0|[1-9][0-9]{0,2})$") and tonumber<=255));
+      def subnet: type=="string" and endswith(".0/24") and (split("/")[0]|ip);
+      def path: type=="string" and startswith("/") and .!="/" and
+        test("^/[a-zA-Z0-9_./-]+$") and (split("/") | all(.[]; .!=".." and .!="."));
+      (.NODE_ROLE|IN("worker","storage")) and (.NODE_NAME|name) and
+      (.ETCD_ENDPOINT|type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9.-]*:[1-9][0-9]{0,4}$") and
+        (split(":")[-1]|tonumber<=65535)) and
+      ([.LOG_DIR,.ETCD_DIR,.IPAM_STATE,.NAMESPACE_DIR,.POD_STATE_DIR,.ROOTFS,.IPAM_SOCKET,.NETWORK_SOCKET]|all(.[];path)) and
+      (.ETCD_BIND|ip) and (.ETCD_PORT|test("^[1-9][0-9]{0,4}$") and tonumber<=65535) and
+      (.RECONCILE_INTERVAL|test("^[1-9][0-9]*$")) and
+      (.IPAM_SOCKET|length<100) and (.NETWORK_SOCKET|length<100) and (.IPAM_SOCKET!=.NETWORK_SOCKET) and
+      (if .NODE_ROLE=="worker" then (.NODE_IP|ip) and (.POD_SUBNET|subnet) and
+        (.NET_BRIDGE|test("^[a-zA-Z][a-zA-Z0-9_-]{0,14}$")) and
+        (.POD_SUBNET as $s | .NET_ROUTES|fromjson|type=="object" and all(to_entries[];
+          (.key|subnet) and .key!=$s and (.value|ip)))
+       else true end)
+    ' <<< "$config" >/dev/null || { echo "Invalid Node configuration: $file" >&2; return 1; }
+    jq -cS '.NET_ROUTES |= (fromjson|tojson)' <<< "$config"
+}
