@@ -110,27 +110,37 @@ node_wait_ready() {
 }
 
 node_stop_service() {
-    local service="$1" pid deadline
+    local service="$1"
+    local pid='' deadline
 
-    if ! node_alive "$service"; then
-        rm -f -- "$STATE/$service.pid"
-        printf '%s: already stopped\n' "$service"
-        return 0
-    fi
-    pid=$(node_pid "$service")
-    # Recheck immediately before signalling; PID alone is never ownership proof.
     if node_alive "$service"; then
-        kill -TERM "$pid" || { node_alive "$service" && return 1; }
+        pid=$(node_pid "$service") || return 1
+
+        # Recheck ownership immediately before signalling.
+        if node_alive "$service"; then
+            if ! kill -TERM "$pid"; then
+                if node_alive "$service"; then
+                    return 1
+                fi
+            fi
+        fi
     fi
+
     deadline=$((SECONDS + 20))
-    while node_alive "$service"; do
+
+    while node_alive "$service" || ! node_service_locks_free "$service"; do
         if ((SECONDS >= deadline)); then
-            echo "$service: stop timed out; record retained, dependencies kept running." >&2
+            echo "$service: stop timed out; process or service locks still active. Record retained." >&2
             return 1
         fi
+
         sleep 0.2
     done
-    wait "$pid" 2>/dev/null || true
+
+    if [[ -n "$pid" ]]; then
+        wait "$pid" 2>/dev/null || true
+    fi
+
     rm -f -- "$STATE/$service.pid"
     printf '%s: stopped\n' "$service"
 }
@@ -179,6 +189,41 @@ node_lock_free() {
     local path="$1"
 
     [[ ! -e "$path" ]] || flock -n "$path" true
+}
+
+node_service_locks_free() {
+    local service="$1"
+    local locks path
+
+    case "$service" in
+        kubelet)
+            locks=/run/k8s-from-scratch/kubelet.lock
+            ;;
+        ipamd)
+            locks=$(jq -er '[
+                (.env.IPAM_STATE + ".lock"),
+                (.env.IPAM_SOCKET + ".lock")
+            ] | .[]' <<< "$SNAPSHOT") || return 1
+            ;;
+        networkd)
+            locks=$(jq -er '[
+                "/run/k8s-from-scratch-network.lock",
+                (.env.NETWORK_SOCKET + ".lock")
+            ] | .[]' <<< "$SNAPSHOT") || return 1
+            ;;
+        etcdd)
+            locks=$(jq -er '
+                .env.ETCD_DIR + "/server.lock"
+            ' <<< "$SNAPSHOT") || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    while IFS= read -r path; do
+        node_lock_free "$path" || return 1
+    done <<< "$locks"
 }
 
 node_preflight() {
