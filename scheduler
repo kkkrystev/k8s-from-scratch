@@ -1,0 +1,152 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$SCRIPT_DIR/lib/validate.sh"
+source "$SCRIPT_DIR/lib/etcd-client.sh"
+
+SCHEDULER_INTERVAL="${SCHEDULER_INTERVAL:-2}"
+NODES=()
+NEXT_NODE=0
+
+scheduler_log() {
+    printf '[%s] [scheduler] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+scheduler_config() {
+    local file="$1"
+    local config names node endpoint
+
+    config=$(jq -cse '
+        select(length == 1)
+        | .[0]
+        | select(
+            type == "object"
+            and (.storage | type == "object")
+            and (.storage.endpoint | type == "string")
+            and (
+                .workers
+                | type == "array" and length > 0
+                and all(.[];
+                    type == "object"
+                    and (
+                        .name
+                        | type == "string"
+                        and length <= 63
+                        and test("^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$")
+                    )
+                )
+            )
+        )
+        | select(
+            ([.workers[].name] | length)
+            == ([.workers[].name] | unique | length)
+        )
+    ' "$file") || {
+        echo 'Invalid scheduler configuration: expected an endpoint and unique workers.' >&2
+        return 1
+    }
+
+    names=$(jq -r '.workers[].name' <<< "$config") || return 1
+    NODES=()
+
+    while IFS= read -r node; do
+        validate_name "$node" || return 1
+        NODES+=("$node")
+    done <<< "$names"
+
+    endpoint=$(jq -r '.storage.endpoint' <<< "$config") || return 1
+    ETCD_ENDPOINT="${ETCD_ENDPOINT:-$endpoint}"
+    NEXT_NODE=0
+}
+
+schedule_pod() {
+    local name="$1"
+    local spec node uid deleting
+
+    validate_name "$name" || return 1
+
+    spec=$(etcd_get_optional "pods/$name/spec") || return 1
+    [[ -n "$spec" ]] || return 0
+
+    node=$(jq -r '
+        .node_name
+        | if type == "string" then
+            .
+          else
+            error("node_name must be a string")
+          end
+    ' <<< "$spec") || return 1
+
+    [[ -z "$node" ]] || return 0
+
+    deleting=$(etcd_get_optional "pods/$name/deleting") || return 1
+    [[ -z "$deleting" ]] || return 0
+
+    uid=$(jq -er '.uid | select(type == "string" and length > 0)' <<< "$spec") || return 1
+    node="${NODES[NEXT_NODE]}"
+
+    # The server rechecks UID, assignment and deletion before committing.
+    if ! etcd_assign_pod "$name" "$uid" "$node"; then
+        scheduler_log "Assignment not confirmed for '$name'; will read its state again."
+        return 1
+    fi
+
+    NEXT_NODE=$(((NEXT_NODE + 1) % ${#NODES[@]}))
+    scheduler_log "Pod '$name' assigned to '$node'."
+}
+
+schedule_once() {
+    local names name
+
+    names=$(etcd_pod_names) || return 1
+    [[ -n "$names" ]] || return 0
+
+    while IFS= read -r name; do
+        if ! schedule_pod "$name"; then
+            scheduler_log "Could not schedule '$name'; continuing with the remaining Pods."
+        fi
+    done <<< "$names"
+}
+
+main() {
+    if [[ $# != 1 ]]; then
+        echo "Usage: $0 <cluster.json>" >&2
+        return 1
+    fi
+
+    [[ "$SCHEDULER_INTERVAL" =~ ^[1-9][0-9]*$ ]] || {
+        echo 'SCHEDULER_INTERVAL must be a positive integer.' >&2
+        return 1
+    }
+
+    scheduler_config "$1" || return 1
+
+    mkdir -p /run/k8s-from-scratch
+    exec 6>/run/k8s-from-scratch/scheduler.lock
+
+    flock -n 6 || {
+        echo 'Scheduler already running on this Node.' >&2
+        return 1
+    }
+
+    etcd_health > /dev/null || return 1
+
+    scheduler_log "Starting endpoint=$ETCD_ENDPOINT workers=${NODES[*]} interval=${SCHEDULER_INTERVAL}s."
+
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    while true; do
+        if ! schedule_once; then
+            scheduler_log 'Cannot list Pods; will retry.'
+        fi
+
+        sleep "$SCHEDULER_INTERVAL"
+    done
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
