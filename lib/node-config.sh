@@ -21,7 +21,7 @@ node_config() {
         value=${line#*=}
 
         case "$key" in
-            RUN_ETCD | RUN_WORKER | NODE_NAME | NODE_IP | \
+            RUN_ETCD | RUN_WORKER | RUN_SCHEDULER | SCHEDULER_NODES | SCHEDULER_INTERVAL | NODE_NAME | NODE_IP | \
             POD_SUBNET | NET_BRIDGE | NET_ROUTES | \
             ETCD_ENDPOINT | ETCD_BIND | ETCD_PORT | ETCD_DIR | \
             IPAM_SOCKET | NETWORK_SOCKET | IPAM_STATE | \
@@ -49,6 +49,9 @@ node_config() {
         {
             RUN_ETCD: "false",
             RUN_WORKER: "false",
+            RUN_SCHEDULER: "false",
+            SCHEDULER_NODES: "[]",
+            SCHEDULER_INTERVAL: "2",
             NET_BRIDGE: "kfs0",
             NET_ROUTES: "{}",
             IPAM_SOCKET: "/run/k8s-from-scratch/ipam.sock",
@@ -110,7 +113,17 @@ node_config() {
 
         (.RUN_ETCD | IN("true", "false"))
         and (.RUN_WORKER | IN("true", "false"))
-        and (.RUN_ETCD == "true" or .RUN_WORKER == "true")
+        and (.RUN_SCHEDULER | IN("true", "false"))
+        and (.SCHEDULER_INTERVAL | test("^[1-9][0-9]*$"))
+        and (.RUN_ETCD == "true" or .RUN_WORKER == "true" or .RUN_SCHEDULER == "true")
+        and (
+            .RUN_SCHEDULER as $enabled
+            | .SCHEDULER_NODES | fromjson
+            | type == "array"
+            and all(.[]; name)
+            and (length == (unique | length))
+            and (if $enabled == "true" then length > 0 else true end)
+        )
         and (.NODE_NAME | name)
 
         and (
@@ -171,5 +184,5 @@ node_config() {
         return 1
     }
 
-    jq -cS '.NET_ROUTES |= (fromjson | tojson)' <<< "$config"
+    jq -cS '.NET_ROUTES |= (fromjson | tojson) | .SCHEDULER_NODES |= (fromjson | tojson)' <<< "$config"
 }

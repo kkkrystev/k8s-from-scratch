@@ -39,7 +39,16 @@ cluster=$(jq -cse '
 
     select(length == 1)
     | .[0]
-    | select(keys == ["defaults", "storage", "workers"])
+    | select(keys == ["defaults", "storage", "workers"]
+        or keys == ["defaults", "scheduler", "storage", "workers"])
+    | select(
+        if has("scheduler") then
+            .scheduler | type == "object"
+            and keys == ["interval", "name"]
+            and (.name | name)
+            and (.interval | type == "string" and test("^[1-9][0-9]*$"))
+        else true end
+    )
 
     | select(.storage |
         keys == ["bind", "dir", "endpoint", "name", "port"]
@@ -121,11 +130,15 @@ while IFS= read -r name; do
         . as $c
         | ([.workers[] | select(.name == $name)][0]) as $worker
         | (.storage.name == $name) as $storage
+        | (.scheduler.name == $name) as $scheduler
 
         | $c.defaults + {
             NODE_NAME: $name,
             ETCD_ENDPOINT: $c.storage.endpoint,
             RUN_ETCD: ($storage | tostring),
+            RUN_SCHEDULER: ($scheduler | tostring),
+            SCHEDULER_NODES: ([$c.workers[].name] | tojson),
+            SCHEDULER_INTERVAL: ($c.scheduler.interval // "2"),
             RUN_WORKER: (($worker != null) | tostring)
         }
 
@@ -165,7 +178,7 @@ while IFS= read -r name; do
     ' <<< "$config" > "$tmp/$name.env"
 
     node_config "$tmp/$name.env" > /dev/null
-done < <(jq -r '[.workers[].name, .storage.name] | unique[]' <<< "$cluster")
+done < <(jq -r '[.workers[].name, .storage.name, (.scheduler.name // empty)] | unique[]' <<< "$cluster")
 
 # Refuse to overwrite differing files. Review changes in a new directory.
 for file in "$tmp"/*.env; do

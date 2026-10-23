@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/validate.sh"
 source "$SCRIPT_DIR/lib/etcd-client.sh"
 
-SCHEDULER_INTERVAL="${SCHEDULER_INTERVAL:-2}"
+SCHEDULER_INTERVAL="${SCHEDULER_INTERVAL:-}"
 NODES=()
 NEXT_NODE=0
 
@@ -15,8 +15,17 @@ scheduler_log() {
 }
 
 scheduler_config() {
-    local file="$1"
+    local file="${1:-}"
     local config names node endpoint
+
+    if [[ -n "$file" ]]; then
+        config=$(cat -- "$file") || return 1
+    else
+        config=$(jq -cn --arg endpoint "${ETCD_ENDPOINT:-}" \
+            --argjson nodes "${SCHEDULER_NODES:-[]}" '
+                {storage: {endpoint: $endpoint}, workers: [$nodes[] | {name: .}]}
+            ') || return 1
+    fi
 
     config=$(jq -cse '
         select(length == 1)
@@ -43,7 +52,7 @@ scheduler_config() {
             ([.workers[].name] | length)
             == ([.workers[].name] | unique | length)
         )
-    ' "$file") || {
+    ' <<< "$config") || {
         echo 'Invalid scheduler configuration: expected an endpoint and unique workers.' >&2
         return 1
     }
@@ -58,6 +67,7 @@ scheduler_config() {
 
     endpoint=$(jq -r '.storage.endpoint' <<< "$config") || return 1
     ETCD_ENDPOINT="${ETCD_ENDPOINT:-$endpoint}"
+    SCHEDULER_INTERVAL="${SCHEDULER_INTERVAL:-$(jq -r '.scheduler.interval // "2"' <<< "$config")}"
     NEXT_NODE=0
 }
 
@@ -111,17 +121,19 @@ schedule_once() {
 }
 
 main() {
-    if [[ $# != 1 ]]; then
-        echo "Usage: $0 <cluster.json>" >&2
+    if [[ $# -gt 1 ]]; then
+        echo "Usage: $0 [cluster.json] (or ETCD_ENDPOINT and SCHEDULER_NODES)" >&2
         return 1
     fi
+
+    scheduler_config "${1:-}" || return 1
 
     [[ "$SCHEDULER_INTERVAL" =~ ^[1-9][0-9]*$ ]] || {
         echo 'SCHEDULER_INTERVAL must be a positive integer.' >&2
         return 1
     }
 
-    scheduler_config "$1" || return 1
+    etcd_health > /dev/null || return 1
 
     mkdir -p /run/k8s-from-scratch
     exec 6>/run/k8s-from-scratch/scheduler.lock
@@ -131,12 +143,10 @@ main() {
         return 1
     }
 
-    etcd_health > /dev/null || return 1
-
     scheduler_log "Starting endpoint=$ETCD_ENDPOINT workers=${NODES[*]} interval=${SCHEDULER_INTERVAL}s."
 
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    trap 'scheduler_log "Stopping (SIGINT)."; exit 130' INT
+    trap 'scheduler_log "Stopping (SIGTERM)."; exit 143' TERM
 
     while true; do
         if ! schedule_once; then

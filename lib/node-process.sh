@@ -49,6 +49,10 @@ node_services() {
     if [[ $(jq -r '.env.RUN_WORKER' <<< "$SNAPSHOT") == true ]]; then
         SERVICES+=(ipamd networkd kubelet)
     fi
+
+    if [[ $(jq -r '.env.RUN_SCHEDULER' <<< "$SNAPSHOT") == true ]]; then
+        SERVICES+=(scheduler)
+    fi
 }
 
 node_environment() {
@@ -81,8 +85,8 @@ node_health() {
             fi
             expr='source "$1/lib/etcd-client.sh"; etcd_health'
             ;;
-        kubelet)
-            node_alive kubelet
+        kubelet | scheduler)
+            node_alive "$service"
             return
             ;;
     esac
@@ -91,15 +95,16 @@ node_health() {
 
 node_wait_ready() {
     local service="$1" deadline=$((SECONDS + 20))
+    local lock="/run/k8s-from-scratch/$service.lock"
 
-    # kubelet has no health RPC. Give its startup checks time, then test its lock.
+    # These reconcilers have no health RPC; check ownership and their lifetime lock.
     while ((SECONDS < deadline)); do
         node_alive "$service" || return 1
-        if [[ "$service" == kubelet ]]; then
-            if [[ -f /run/k8s-from-scratch/kubelet.lock ]] &&
-                ! flock -n /run/k8s-from-scratch/kubelet.lock true; then
+        if [[ "$service" == kubelet || "$service" == scheduler ]]; then
+            if [[ -f "$lock" ]] &&
+                ! flock -n "$lock" true; then
                 sleep 0.3
-                node_alive kubelet && return 0
+                node_alive "$service" && return 0
             fi
         elif node_health "$service" && node_alive "$service"; then
             return 0
@@ -107,6 +112,42 @@ node_wait_ready() {
         sleep 0.2
     done
     return 1
+}
+
+node_service_locks_free() {
+    local service="$1"
+    local locks path
+
+    case "$service" in
+        scheduler)
+            locks=/run/k8s-from-scratch/scheduler.lock
+            ;;
+        kubelet)
+            locks=/run/k8s-from-scratch/kubelet.lock
+            ;;
+        ipamd)
+            locks=$(jq -er '[
+                (.env.IPAM_STATE + ".lock"),
+                (.env.IPAM_SOCKET + ".lock")
+            ] | .[]' <<< "$SNAPSHOT") || return 1
+            ;;
+        networkd)
+            locks=$(jq -er '[
+                "/run/k8s-from-scratch-network.lock",
+                (.env.NETWORK_SOCKET + ".lock")
+            ] | .[]' <<< "$SNAPSHOT") || return 1
+            ;;
+        etcdd)
+            locks=$(jq -er '.env.ETCD_DIR + "/server.lock"' <<< "$SNAPSHOT") || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    while IFS= read -r path; do
+        node_lock_free "$path" || return 1
+    done <<< "$locks"
 }
 
 node_stop_service() {
@@ -167,7 +208,7 @@ node_unmanaged() {
         # Ignore handlers; daemon lifetime/locks handle them.
         [[ ${args[index + 1]:-} != --handle ]] || continue
         case "$script" in
-            ipamd | networkd | kubelet | etcdd)
+            ipamd | networkd | kubelet | etcdd | scheduler)
                 service="$script"
                 ;;
             *)
@@ -191,41 +232,6 @@ node_lock_free() {
     [[ ! -e "$path" ]] || flock -n "$path" true
 }
 
-node_service_locks_free() {
-    local service="$1"
-    local locks path
-
-    case "$service" in
-        kubelet)
-            locks=/run/k8s-from-scratch/kubelet.lock
-            ;;
-        ipamd)
-            locks=$(jq -er '[
-                (.env.IPAM_STATE + ".lock"),
-                (.env.IPAM_SOCKET + ".lock")
-            ] | .[]' <<< "$SNAPSHOT") || return 1
-            ;;
-        networkd)
-            locks=$(jq -er '[
-                "/run/k8s-from-scratch-network.lock",
-                (.env.NETWORK_SOCKET + ".lock")
-            ] | .[]' <<< "$SNAPSHOT") || return 1
-            ;;
-        etcdd)
-            locks=$(jq -er '
-                .env.ETCD_DIR + "/server.lock"
-            ' <<< "$SNAPSHOT") || return 1
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    while IFS= read -r path; do
-        node_lock_free "$path" || return 1
-    done <<< "$locks"
-}
-
 node_preflight() {
     local project path service
 
@@ -247,6 +253,9 @@ node_preflight() {
                 node_lock_free /run/k8s-from-scratch-network.lock || return 1
                 path=$(jq -r '.env.NETWORK_SOCKET + ".lock"' <<< "$SNAPSHOT")
                 ;;
+            scheduler)
+                path=/run/k8s-from-scratch/scheduler.lock
+                ;;
             kubelet)
                 path=/run/k8s-from-scratch/kubelet.lock
                 ;;
@@ -262,19 +271,21 @@ node_preflight() {
     if [[ $(jq -r '.env.RUN_WORKER' <<< "$SNAPSHOT") == true ]]; then
         node_environment
         "${ENV_ARGS[@]}" bash -c 'source "$1/lib/validate.sh"; validate_rootfs' _ "$project" || return 1
-        # A local etcdd may not be running yet. Its health is checked at startup.
-        if [[ $(jq -r '.env.RUN_ETCD' <<< "$SNAPSHOT") != true ]]; then
-            "${ENV_ARGS[@]}" bash -c '
-                source "$1/lib/etcd-client.sh"
-                etcd_health
-            ' _ "$project" > /dev/null || return 1
-        fi
         # Detect a node01 config accidentally used in node02 before changing anything.
         ip -j -4 addr show | jq -e --arg ip "$(jq -r '.env.NODE_IP' <<< "$SNAPSHOT")" \
             'any(.[].addr_info[]?; .local==$ip)' >/dev/null || {
             echo 'Configured NODE_IP does not belong to this Node.' >&2
             return 1
         }
+    fi
+
+    if [[ $(jq -r '.env.RUN_ETCD' <<< "$SNAPSHOT") != true ]] &&
+        [[ $(jq -r '.env.RUN_WORKER == "true" or .env.RUN_SCHEDULER == "true"' <<< "$SNAPSHOT") == true ]]; then
+        node_environment
+        "${ENV_ARGS[@]}" bash -c '
+            source "$1/lib/etcd-client.sh"
+            etcd_health
+        ' _ "$project" > /dev/null || return 1
     fi
 }
 
@@ -287,12 +298,12 @@ node_launch() {
     node_environment
 
     # Verify the worker endpoint after any local etcdd has become ready.
-    if [[ "$service" == kubelet ]]; then
+    if [[ "$service" == kubelet || "$service" == scheduler ]]; then
         "${ENV_ARGS[@]}" bash -c '
             source "$1/lib/etcd-client.sh"
             etcd_health
         ' _ "$project" > /dev/null || {
-            echo 'Storage endpoint unavailable; kubelet was not started.' >&2
+            echo "Storage endpoint unavailable; $service was not started." >&2
             return 1
         }
     fi
