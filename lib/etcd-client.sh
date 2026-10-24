@@ -1,4 +1,36 @@
 # TCP JSON-lines client. Exit 2 means missing key; 1 means any other failure.
+etcd_resolve_endpoint() {
+    local snapshot="${1:-/run/kfs-node-manager/config.json}"
+    local endpoint="${ETCD_ENDPOINT:-}"
+
+    if [[ -z "$endpoint" ]]; then
+        if [[ -e "$snapshot" || -L "$snapshot" ]]; then
+            endpoint=$(jq -ers '
+                select(length == 1)
+                | .[0].env.ETCD_ENDPOINT
+                | select(type == "string" and length > 0)
+            ' "$snapshot") || {
+                echo "Cannot read storage endpoint from Node snapshot: $snapshot" >&2
+                return 1
+            }
+        else
+            endpoint=127.0.0.1:2379
+        fi
+    fi
+
+    if [[ ! "$endpoint" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*:[1-9][0-9]{0,4}$ ]]; then
+        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
+        return 1
+    fi
+
+    if (( ${endpoint##*:} > 65535 )); then
+        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
+        return 1
+    fi
+
+    printf '%s\n' "$endpoint"
+}
+
 etcd_call() {
     local request="$1" response
     local endpoint="${ETCD_ENDPOINT:-127.0.0.1:2379}"

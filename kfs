@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-ETCD_ENDPOINT="${ETCD_ENDPOINT:-127.0.0.1:2379}"
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/validate.sh"
 source "${SCRIPT_DIR}/lib/etcd-client.sh"
@@ -41,5 +39,7 @@ main() {
             ;;
     esac
 }
+
+ETCD_ENDPOINT=$(etcd_resolve_endpoint) || exit 1
 
 main "$@"
