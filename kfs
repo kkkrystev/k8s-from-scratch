@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/lib/delete.sh"
 
 usage() {
     echo "Usage:"
-    echo "  $0 create --node <node> <name> <command> [args...]   # declare a pod (kubelet will start it)"
+    echo "  $0 create [--node <node>] <name> <command> [args...]   # declare a pod (kubelet will start it)"
     echo "  $0 list                                # list all pods"
     echo "  $0 get <name>                          # show pod details"
     echo "  $0 delete <name> [name ...]            # mark pods for deletion"

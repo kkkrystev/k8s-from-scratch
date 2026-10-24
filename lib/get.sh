@@ -11,7 +11,7 @@ cmd_get() {
     fi
     node=$(jq -r '.node_name' <<< "$spec") || return 1
     status=$(etcd_get_optional "pods/$name/status") || return 1
-    printf 'Node:      %s\n' "$node"
+    printf 'Node:      %s\n' "${node:--}"
     state=$(json_get_field "$status" state) || return 1
     started=$(json_get_field "$status" started_at) || return 1
     exited=$(json_get_field "$status" exited_at) || return 1

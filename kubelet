@@ -104,12 +104,25 @@ launch_pod() {
 }
 
 reconcile_pod() {
-    local name="$1" spec actual status state result pod_ip uid deleting
+    local name="$1" spec actual status state result pod_ip uid deleting node
     validate_name "$name" || return 1
 
     spec=$(etcd_get_optional "pods/$name/spec") || return 1
     [[ -n "$spec" ]] || return 0
-    [[ $(jq -er '.node_name' <<< "$spec") == "$NODE_NAME" ]] || return 0
+
+    node=$(jq -r '
+        (if has("node_name") then .node_name else "" end)
+        | if type == "string" then
+            .
+          else
+            error("node_name must be a string")
+          end
+    ' <<< "$spec") || return 1
+
+    # Unassigned Pods wait for the scheduler; foreign Pods belong to another kubelet.
+    [[ -n "$node" ]] || return 0
+    [[ "$node" == "$NODE_NAME" ]] || return 0
+
     uid=$(jq -er '.uid' <<< "$spec") || return 1
     deleting=$(etcd_get_optional "pods/$name/deleting") || return 1
 

@@ -5,3 +5,5 @@ claude-misc
 reset.sh
 logs
 reset-emergency.sh
+/config/generated/
+/config/generated-combined/
