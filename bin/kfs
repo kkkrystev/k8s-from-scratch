@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+source "$PROJECT_ROOT/lib/validate.sh"
+source "$PROJECT_ROOT/lib/storage/client.sh"
+source "$PROJECT_ROOT/lib/json.sh"
+source "$PROJECT_ROOT/lib/cli/create.sh"
+source "$PROJECT_ROOT/lib/cli/list.sh"
+source "$PROJECT_ROOT/lib/cli/get.sh"
+source "$PROJECT_ROOT/lib/cli/delete.sh"
+
+usage() {
+    echo "Usage:"
+    echo "  $0 create [--node <node>] <name> <command> [args...]   # declare a pod (kubelet will start it)"
+    echo "  $0 list                                # list all pods"
+    echo "  $0 get <name>                          # show pod details"
+    echo "  $0 delete <name> [name ...]            # mark pods for deletion"
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        return 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        create) create_pod "$@" ;;
+        list)   cmd_list "$@" ;;
+        get)    cmd_get "$@" ;;
+        delete) cmd_delete "$@" ;;
+        *)
+            echo "Unknown command: $action" >&2
+            usage
+            return 1
+            ;;
+    esac
+}
+
+ETCD_ENDPOINT=$(etcd_resolve_endpoint) || exit 1
+
+main "$@"

@@ -118,7 +118,7 @@ cluster=$(jq -cse '
 }
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-source "$root/lib/node-config.sh"
+source "$root/lib/node/config.sh"
 
 mkdir -p -- "$output"
 tmp=$(mktemp -d "$output/.generate.XXXXXX")

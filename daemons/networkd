@@ -1,0 +1,113 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+source "$PROJECT_ROOT/lib/ipam/client.sh"
+source "$PROJECT_ROOT/lib/network/config.sh"
+source "$PROJECT_ROOT/lib/network/bridge.sh"
+source "$PROJECT_ROOT/lib/network/routes.sh"
+source "$PROJECT_ROOT/lib/network/pod.sh"
+source "$PROJECT_ROOT/lib/network/service.sh"
+export NET_SUBNET="${NET_SUBNET:-10.244.1.0/24}"
+export NET_BRIDGE="${NET_BRIDGE:-kfs0}"
+export NETNS_DIR="${NETNS_DIR:-/run/k8s-from-scratch}"
+export IPAM_SOCKET="${IPAM_SOCKET:-/run/k8s-from-scratch/ipam.sock}"
+if [[ ! -v NET_ROUTES ]]; then NET_ROUTES='{}'; fi
+export NET_ROUTES
+net_config || { echo 'Invalid networking configuration.' >&2; exit 1; }
+
+reply_error() {
+    printf '{"ok":false,"error":"%s"}\n' "$1"
+}
+
+handle_request() {
+    local request
+
+    # Bound the wait and the amount of data read from one client.
+    if ! IFS= read -r -t "$IPC_READ_TIMEOUT" -n 8193 request; then
+        reply_error incomplete_request
+        return
+    fi
+    if ((${#request} > 8192)); then
+        reply_error request_too_large
+        return
+    fi
+    network_dispatch "$request"
+}
+
+export LC_ALL=C
+export IPC_READ_TIMEOUT="${IPC_READ_TIMEOUT:-3}"
+[[ "$IPC_READ_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'IPC_READ_TIMEOUT must be a positive integer.' >&2
+    exit 1
+}
+
+# socat replaces itself with this handler after accepting one connection.
+if [[ ${1:-} == --handle && $# -eq 1 ]]; then
+    flock -n 8 2>/dev/null || { echo 'Missing Node networking lock.' >&2; exit 1; }
+    handle_request
+    exit
+fi
+
+[[ $# -le 1 ]] || { echo "Usage: $0 [absolute-socket-path]" >&2; exit 1; }
+socket="${1:-/run/k8s-from-scratch/network.sock}"
+[[ "$socket" == /* && "$socket" != *[[:space:],:]* && ${#socket} -lt 100 ]] || {
+    echo 'Use an absolute socket path under 100 characters, without spaces, commas or colons.' >&2
+    exit 1
+}
+
+[[ $EUID -eq 0 ]] || { echo 'Run inside the privileged Ubuntu Node as root.' >&2; exit 1; }
+for cmd in socat jq flock setpriv ip nsenter findmnt sysctl; do
+    command -v "$cmd" >/dev/null || { echo "Missing command: $cmd" >&2; exit 1; }
+done
+
+umask 077
+mkdir -p -- "$(dirname -- "$socket")"
+exec 9>"$socket.lock"
+flock -n 9 || { echo "Daemon already running: $socket" >&2; exit 1; }
+
+# Never remove an ordinary file, directory or symlink at the socket path.
+if [[ -L "$socket" || ( -e "$socket" && ! -S "$socket" ) ]]; then
+    echo "Refusing to remove non-socket: $socket" >&2
+    exit 1
+fi
+mkdir -p -- "$NETNS_DIR"
+exec 8>/run/k8s-from-scratch-network.lock
+flock -n 8 || { echo 'A network daemon is already running on this Node.' >&2; exit 1; }
+ipam_health >/dev/null || { echo 'IPAM is not ready.' >&2; exit 1; }
+net_setup || { echo 'Node network setup failed; inspect interfaces and routes.' >&2; exit 1; }
+[[ ! -S "$socket" ]] || rm -- "$socket"
+
+child=""
+cleanup() {
+    trap - EXIT INT TERM
+    if [[ -n "$child" ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    [[ ! -S "$socket" ]] || rm -- "$socket"
+    # Keep the lock file: removing it could allow separate lock identities.
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
+printf 'Network Provisioner listening on %s\n' "$socket" >&2
+while true; do
+    # One accept, one handler, then listen again. No concurrent handlers.
+    # nofork keeps the listener and handler PID identical. Parent death stops it.
+    setpriv --pdeathsig TERM socat \
+        "UNIX-LISTEN:$socket,mode=0600,unlink-close=0" \
+        'EXEC:bash ./networkd --handle,nofork' &
+    child=$!
+    if wait "$child"; then rc=0; else rc=$?; fi
+    child=""
+    [[ ! -S "$socket" ]] || rm -- "$socket"
+    if ((rc != 0)); then
+        echo "Listener/handler failed (exit $rc)." >&2
+        exit "$rc"
+    fi
+done
