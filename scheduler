@@ -121,6 +121,8 @@ schedule_once() {
 }
 
 main() {
+    local lock_fd
+
     if [[ $# -gt 1 ]]; then
         echo "Usage: $0 [cluster.json] (or ETCD_ENDPOINT and SCHEDULER_NODES)" >&2
         return 1
@@ -136,9 +138,9 @@ main() {
     etcd_health > /dev/null || return 1
 
     mkdir -p /run/k8s-from-scratch
-    exec 6>/run/k8s-from-scratch/scheduler.lock
+    exec {lock_fd}>/run/k8s-from-scratch/scheduler.lock || return 1
 
-    flock -n 6 || {
+    flock -n "$lock_fd" || {
         echo 'Scheduler already running on this Node.' >&2
         return 1
     }

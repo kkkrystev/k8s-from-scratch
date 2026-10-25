@@ -1,4 +1,7 @@
 # TCP JSON-lines client. Exit 2 means missing key; 1 means any other failure.
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/validate.sh"
+
 etcd_resolve_endpoint() {
     local snapshot="${1:-/run/kfs-node-manager/config.json}"
     local endpoint="${ETCD_ENDPOINT:-}"
@@ -18,15 +21,7 @@ etcd_resolve_endpoint() {
         fi
     fi
 
-    if [[ ! "$endpoint" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*:[1-9][0-9]{0,4}$ ]]; then
-        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
-        return 1
-    fi
-
-    if (( ${endpoint##*:} > 65535 )); then
-        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
-        return 1
-    fi
+    validate_etcd_endpoint "$endpoint" || return 1
 
     printf '%s\n' "$endpoint"
 }
@@ -36,17 +31,9 @@ etcd_call() {
     local endpoint="${ETCD_ENDPOINT:-127.0.0.1:2379}"
     local timeout="${ETCD_TIMEOUT:-5}" error
 
-    if [[ ! "$endpoint" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*:[1-9][0-9]{0,4}$ ]]; then
-        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
-        return 1
-    fi
+    validate_etcd_endpoint "$endpoint" || return 1
 
-    if (( ${endpoint##*:} > 65535 )); then
-        echo 'Invalid ETCD_ENDPOINT (host:port).' >&2
-        return 1
-    fi
-
-    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || return 1
+    validate_positive_integer "$timeout" || return 1
 
     if ((${#request} > 65536)); then
         echo 'Storage request too large.' >&2

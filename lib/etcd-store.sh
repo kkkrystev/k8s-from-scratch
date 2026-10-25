@@ -20,7 +20,6 @@ store_load() {
         | .[0]
         | select(
             type == "object"
-            and .version == 1
             and (.keys | type == "object" and all(.[]; type == "string"))
         )
     ' "$ETCD_DIR/state.json"
