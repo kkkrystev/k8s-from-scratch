@@ -54,7 +54,7 @@ store_get() {
         return "$STORE_REPLIED"
     fi
 
-    jq -c --arg key "$key" '{ok: true, value: .keys[$key]}' <<< "$state"
+    jq -c --arg key "$key" '{ok: true, value: .keys[$key]}' <<< "$state" || return 1
     return "$STORE_REPLIED"
 }
 
@@ -74,7 +74,7 @@ store_list() {
                 | select($p == "" or . == $p or startswith($p + "/"))
             ]
         }
-    ' <<< "$state"
+    ' <<< "$state" || return 1
     return "$STORE_REPLIED"
 }
 
@@ -138,7 +138,6 @@ store_create_pod() {
     fi
 
     uid=$(cat /proc/sys/kernel/random/uuid) || return 1
-    STORE_UID="$uid"
 
     spec=$(jq -c --arg uid "$uid" '. + {uid: $uid}' <<< "$spec") || return 1
     jq -c --arg k "$key" --arg v "$spec" '.keys[$k] = $v' <<< "$state"
@@ -257,7 +256,7 @@ store_pod_guard() {
 
 store_dispatch() {
     local request action key value prefix name current next state node
-    local rc
+    local rc=0
 
     request=$(jq -cse '
         select(length == 1)
@@ -301,10 +300,8 @@ store_dispatch() {
         current=$(jq -r --arg key "$key" '.keys[$key] // empty' <<< "$state")
     fi
 
-    # REQUEST and STORE_UID let the action helpers read the request and report a
-    # new UID without threading extra arguments through every call.
-    REQUEST="$request"
-    STORE_UID=''
+    # Bash dynamic scope exposes the request only while dispatching this call.
+    local REQUEST="$request"
 
     case "$action" in
         health)
@@ -313,28 +310,31 @@ store_dispatch() {
             ;;
 
         get)
-            store_get "$state" "$key"
-            return
+            store_get "$state" "$key" || rc=$?
+            if ((rc != STORE_REPLIED)); then
+                store_error storage_error
+            fi
+            return 0
             ;;
 
         list)
-            store_list "$state" "$prefix"
-            return
+            store_list "$state" "$prefix" || rc=$?
+            if ((rc != STORE_REPLIED)); then
+                store_error storage_error
+            fi
+            return 0
             ;;
 
         put | delete)
-            next=$(store_put_delete "$request" "$state" "$key" "$action")
-            rc=$?
+            next=$(store_put_delete "$request" "$state" "$key" "$action") || rc=$?
             ;;
 
         create_pod)
-            next=$(store_create_pod "$request" "$state" "$key" "$current")
-            rc=$?
+            next=$(store_create_pod "$request" "$state" "$key" "$current") || rc=$?
             ;;
 
         assign_pod | mark_pod | status_pod | finish_pod)
-            store_pod_guard "$action" "$current"
-            rc=$?
+            store_pod_guard "$action" "$current" || rc=$?
 
             if ((rc == STORE_REPLIED)); then
                 return
@@ -346,10 +346,18 @@ store_dispatch() {
             fi
 
             case "$action" in
-                assign_pod) next=$(store_assign_pod "$state" "$key" "$name" "$current"); rc=$? ;;
-                mark_pod)   next=$(store_mark_pod "$state" "$name" "$current"); rc=$? ;;
-                status_pod) next=$(store_status_pod "$state" "$name"); rc=$? ;;
-                finish_pod) next=$(store_finish_pod "$state" "$name"); rc=$? ;;
+                assign_pod)
+                    next=$(store_assign_pod "$state" "$key" "$name" "$current") || rc=$?
+                    ;;
+                mark_pod)
+                    next=$(store_mark_pod "$state" "$name" "$current") || rc=$?
+                    ;;
+                status_pod)
+                    next=$(store_status_pod "$state" "$name") || rc=$?
+                    ;;
+                finish_pod)
+                    next=$(store_finish_pod "$state" "$name") || rc=$?
+                    ;;
             esac
             ;;
     esac
@@ -370,5 +378,14 @@ store_dispatch() {
         return
     }
 
-    jq -cn --arg uid "${STORE_UID:-}" '{ok: true, uid: $uid}'
+    # Helpers run in command substitutions; derive the UID from their result.
+    if [[ "$action" == create_pod ]]; then
+        value=$(jq -er --arg key "$key" '.keys[$key] | fromjson | .uid' <<< "$next") || return 1
+    elif [[ "$action" == *_pod ]]; then
+        value=$(jq -er .uid <<< "$current") || return 1
+    else
+        value=''
+    fi
+
+    jq -cn --arg uid "$value" '{ok: true, uid: $uid}'
 }

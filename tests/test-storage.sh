@@ -64,6 +64,38 @@ etcd_mark_pod app-a >/dev/null
 etcd_status_pod app-a "$new_uid" "$(json_build_status terminated)"
 cmd_delete app-a >/dev/null
 [[ -z $(etcd_pod_names) ]]
+# Run dispatch directly under errexit, as in the daemon handler. Each semantic
+# reply must leave the process alive, and rejected writes must retain state.
+ETCD_DIR="$ETCD_DIR/strict" bash -euo pipefail -s -- "$ROOT" <<'STRICT'
+root="$1"
+source "$root/lib/validate.sh"
+source "$root/lib/storage/store.sh"
+source "$root/lib/storage/service.sh"
+mkdir -p "$ETCD_DIR"
+store_commit '{"version":1,"keys":{}}'
+store_dispatch '{"action":"get","key":"missing"}' > "$ETCD_DIR/reply"
+jq -e '.ok == false and .error == "not_found"' "$ETCD_DIR/reply" >/dev/null
+store_dispatch '{"action":"list","prefix":""}' > "$ETCD_DIR/reply"
+jq -e '.ok == true and .keys == []' "$ETCD_DIR/reply" >/dev/null
+store_dispatch '{"action":"mark_pod","name":"missing"}' > "$ETCD_DIR/reply"
+jq -e '.error == "not_found"' "$ETCD_DIR/reply" >/dev/null
+before=$(store_load)
+store_dispatch '{"action":"put","key":"pods/forbidden","value":"x"}' > "$ETCD_DIR/reply"
+jq -e '.error == "protected_key"' "$ETCD_DIR/reply" >/dev/null
+[[ $(store_load) == "$before" ]]
+store_dispatch '{"action":"create_pod","spec":{"name":"strict","containers":[{"name":"strict","command":["/bin/sleep","60"]}]}}' > "$ETCD_DIR/reply"
+uid=$(jq -er '.uid | select(length > 0)' "$ETCD_DIR/reply")
+[[ $(store_load | jq -r '.keys["pods/strict/spec"] | fromjson | .uid') == "$uid" ]]
+before=$(store_load)
+store_dispatch '{"action":"create_pod","spec":{"name":"strict"}}' > "$ETCD_DIR/reply"
+jq -e '.error == "already_exists"' "$ETCD_DIR/reply" >/dev/null
+store_dispatch '{"action":"assign_pod","name":"strict","uid":"old","node_name":"node01"}' > "$ETCD_DIR/reply"
+jq -e '.error == "conflict"' "$ETCD_DIR/reply" >/dev/null
+[[ $(store_load) == "$before" ]]
+store_dispatch '{"action":"mark_pod","name":"strict"}' > "$ETCD_DIR/reply"
+jq -e --arg uid "$uid" '.ok == true and .uid == $uid' "$ETCD_DIR/reply" >/dev/null
+STRICT
+
 # New process sees committed data; damaged storage is not an empty cluster.
 bash -c 'source "$1/lib/storage/store.sh"; source "$1/lib/storage/service.sh"; store_load' _ "$ROOT" | jq -e '.keys["demo/value"] == "quotes \" and spaces"' >/dev/null
 printf 'broken\n' > "$ETCD_DIR/state.json"

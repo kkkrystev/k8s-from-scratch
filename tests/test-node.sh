@@ -37,7 +37,7 @@ trap cleanup EXIT
 
 mkdir -p "$tmp/project/bin" "$tmp/project/lib/node" "$tmp/project/daemons" "$tmp/config" "$tmp/data"
 cp "$ROOT/bin/node" "$tmp/project/bin/node"
-cp -r "$ROOT/lib/node" "$tmp/project/lib/node"
+cp -r "$ROOT/lib/node/." "$tmp/project/lib/node/"
 mkdir -p "$tmp/project/lib/storage"
 
 # Isolate the manager state so production services are not managed by this test.
