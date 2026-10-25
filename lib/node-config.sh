@@ -24,7 +24,7 @@ node_config() {
             RUN_ETCD | RUN_WORKER | RUN_SCHEDULER | SCHEDULER_NODES | SCHEDULER_INTERVAL | NODE_NAME | NODE_IP | \
             POD_SUBNET | NET_BRIDGE | NET_ROUTES | \
             ETCD_ENDPOINT | ETCD_BIND | ETCD_PORT | ETCD_DIR | \
-            IPAM_SOCKET | NETWORK_SOCKET | IPAM_STATE | \
+            IPAM_SOCKET | NETWORK_SOCKET | RUNTIME_SOCKET | RUNTIME_TIMEOUT | IPAM_STATE | \
             NAMESPACE_DIR | POD_STATE_DIR | ROOTFS | LOG_DIR | \
             RECONCILE_INTERVAL)
                 ;;
@@ -55,6 +55,8 @@ node_config() {
             NET_BRIDGE: "kfs0",
             NET_ROUTES: "{}",
             IPAM_SOCKET: "/run/k8s-from-scratch/ipam.sock",
+            RUNTIME_SOCKET: "/run/k8s-from-scratch/runtime.sock",
+            RUNTIME_TIMEOUT: "60",
             NETWORK_SOCKET: "/run/k8s-from-scratch/network.sock",
             IPAM_STATE: "/var/lib/k8s-from-scratch/ipam/state.json",
             NAMESPACE_DIR: "/run/k8s-from-scratch",
@@ -142,7 +144,8 @@ node_config() {
                 .POD_STATE_DIR,
                 .ROOTFS,
                 .IPAM_SOCKET,
-                .NETWORK_SOCKET
+                .NETWORK_SOCKET,
+                .RUNTIME_SOCKET
             ]
             | all(.[]; path)
         )
@@ -158,6 +161,9 @@ node_config() {
         and (.IPAM_SOCKET | length < 100)
         and (.NETWORK_SOCKET | length < 100)
         and (.IPAM_SOCKET != .NETWORK_SOCKET)
+        and (.RUNTIME_SOCKET | length < 100)
+        and (.RUNTIME_TIMEOUT | test("^[1-9][0-9]*$"))
+        and (.RUNTIME_SOCKET != .IPAM_SOCKET and .RUNTIME_SOCKET != .NETWORK_SOCKET)
 
         and (
             if .RUN_WORKER == "true" then

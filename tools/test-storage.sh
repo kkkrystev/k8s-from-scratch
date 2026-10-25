@@ -33,13 +33,10 @@ assert_error "$(jq -cn --arg uid "$uid" '{action:"finish_pod",name:"app-a",uid:$
 socat() { return 1; }
 rc=0; etcd_get_optional missing >/dev/null 2>&1 || rc=$?; [[ $rc == 1 ]]
 NODE_NAME=node01
-RUNTIME_SCRIPT="$ETCD_DIR/runtime"
-cat > "$RUNTIME_SCRIPT" <<'STUB'
-#!/bin/bash
-printf '%s\n' "$*" >> "$ETCD_DIR/runtime-calls"
-[[ $1 != status ]] || echo exited
-STUB
-chmod +x "$RUNTIME_SCRIPT"
+runtime_status() {
+    printf '%s\n' "status $1" >> "$ETCD_DIR/runtime-calls"
+    echo exited
+}
 export ETCD_DIR
 rc=0; reconcile_pod app-a 2>/dev/null || rc=$?; [[ $rc == 1 && ! -e "$ETCD_DIR/runtime-calls" ]]
 socat() { local request; IFS= read -r request; store_dispatch "$request"; }

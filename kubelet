@@ -14,7 +14,7 @@ NETWORK_SOCKET="${NETWORK_SOCKET:-/run/k8s-from-scratch/network.sock}"
 
 export POD_STATE_DIR NAMESPACE_DIR NETWORK_SOCKET
 
-RUNTIME_SCRIPT="$SCRIPT_DIR/runtime.sh"
+source "$SCRIPT_DIR/lib/runtime-client.sh"
 
 source "$SCRIPT_DIR/lib/etcd-client.sh"
 source "$SCRIPT_DIR/lib/json.sh"
@@ -83,9 +83,8 @@ launch_pod() {
 
     # Keep the reservation on failure so the next attempt can reuse the same IP.
     if ! runtime_json=$(
-        "$RUNTIME_SCRIPT" start "$pod_name" \
-            --ip "$pod_ip" --prefix "$prefix" --gateway "$gateway" \
-            -- "${args[@]}" 7>&- 2>> "$KUBELET_LOG"
+        runtime_start "$pod_name" "$pod_ip" "$prefix" "$gateway" \
+            -- "${args[@]}" 2>> "$KUBELET_LOG"
     ); then
         status_json=$(json_build_status \
             unknown null null null "$log_path" null
@@ -127,7 +126,7 @@ reconcile_pod() {
     deleting=$(etcd_get_optional "pods/$name/deleting") || return 1
 
     if [[ -n "$deleting" ]]; then
-        "$RUNTIME_SCRIPT" stop "$name" >> "$KUBELET_LOG" 2>&1 || return 1
+        runtime_stop "$name" >> "$KUBELET_LOG" 2>&1 || return 1
         network_release "$name" >> "$KUBELET_LOG" 2>&1 || return 1
         status=$(etcd_get_optional "pods/$name/status") || return 1
         state=$(json_get_field "$status" state) || return 1
@@ -141,7 +140,7 @@ reconcile_pod() {
         return 0
     fi
 
-    if ! actual=$("$RUNTIME_SCRIPT" status "$name"); then
+    if ! actual=$(runtime_status "$name"); then
         result=$(json_build_status unknown null null null "$POD_STATE_DIR/$name/log") || return 1
         etcd_status_pod "$name" "$uid" "$result" || return 1
 
@@ -155,7 +154,7 @@ reconcile_pod() {
         if [[ "$state" != running ]]; then
 
             # Read actual IP from live netns rather than stale status.
-            pod_ip=$("$RUNTIME_SCRIPT" ip "$name") || return 1
+            pod_ip=$(runtime_ip "$name") || return 1
             result=$(json_build_status running null null null "$POD_STATE_DIR/$name/log" "${pod_ip:-null}") || return 1
             etcd_status_pod "$name" "$uid" "$result" || return 1
         fi
@@ -190,6 +189,7 @@ main() {
     flock -n 7 || { echo 'Kubelet already running on this Node.' >&2; exit 1; }
     mkdir -p -- "$(dirname -- "$KUBELET_LOG")"
     etcd_health >/dev/null || exit 1
+    runtime_health >/dev/null || { echo "Runtime daemon is not ready." >&2; exit 1; }
 
     log "Starting node=$NODE_NAME endpoint=$ETCD_ENDPOINT. Reconcile interval: ${RECONCILE_INTERVAL}s"
 

@@ -1,0 +1,98 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export LC_ALL=C
+export RUNTIME_SOCKET="${RUNTIME_SOCKET:-/run/k8s-from-scratch/runtime.sock}"
+export RUNTIME_TIMEOUT="${RUNTIME_TIMEOUT:-60}"
+
+source "$SCRIPT_DIR/lib/runtime-transport.sh"
+
+case "${1:-}" in
+    --handle)
+        [[ $# == 1 && -n "${RUNTIME_WORK_DIR:-}" ]] || exit 1
+        runtime_handle_connection
+        exit
+        ;;
+    --listen)
+        [[ $# == 1 && -n "${RUNTIME_WORK_DIR:-}" ]] || exit 1
+        runtime_listen
+        exit
+        ;;
+esac
+
+source "$SCRIPT_DIR/lib/runtime-service.sh"
+listener_pid=''
+RUNTIME_STOP_REQUESTED=0
+
+runtime_cleanup() {
+    trap - EXIT INT TERM
+    if [[ -n "$listener_pid" ]]; then
+        kill -TERM "$listener_pid" 2>/dev/null || true
+        wait "$listener_pid" 2>/dev/null || true
+    fi
+    if [[ -n "${RUNTIME_WORK_DIR:-}" ]]; then
+        rm -rf -- "$RUNTIME_WORK_DIR"
+    fi
+    # Leave Pod processes, namespaces, rootfs and IP reservations intact.
+}
+
+main() {
+    local command directory
+    [[ $# == 0 ]] || { echo "Usage: $0" >&2; return 1; }
+    [[ $EUID == 0 ]] || { echo 'Run runtimed as root on the Node.' >&2; return 1; }
+    [[ "$RUNTIME_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$RUNTIME_SOCKET" == /* && "$RUNTIME_SOCKET" != *[[:space:],:]* && ${#RUNTIME_SOCKET} -lt 100 ]] || return 1
+    for command in socat jq flock setpriv unshare nsenter findmnt timeout; do
+        command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; return 1; }
+    done
+    validate_runtime_directories || return 1
+    umask 077
+    mkdir -p /run/k8s-from-scratch "$(dirname -- "$RUNTIME_SOCKET")" || return 1
+    exec {RUNTIME_LOCK_FD}>/run/k8s-from-scratch/runtimed.lock
+    flock -n "$RUNTIME_LOCK_FD" || { echo 'Runtime daemon already running on this Node.' >&2; return 1; }
+    exec {RUNTIME_SOCKET_LOCK_FD}>"$RUNTIME_SOCKET.lock"
+    flock -n "$RUNTIME_SOCKET_LOCK_FD" || { echo 'Runtime socket is already in use.' >&2; return 1; }
+    if [[ -L "$RUNTIME_SOCKET" || ( -e "$RUNTIME_SOCKET" && ! -S "$RUNTIME_SOCKET" ) ]]; then
+        echo "Refusing to remove non-socket: $RUNTIME_SOCKET" >&2
+        return 1
+    fi
+    network_health >/dev/null || { echo 'Network daemon is not ready.' >&2; return 1; }
+    [[ ! -S "$RUNTIME_SOCKET" ]] || rm -- "$RUNTIME_SOCKET"
+    # Both locks are held: no previous daemon/listener can still use these files.
+    for directory in "$RUNTIME_SOCKET".requests.????????; do
+        if [[ -d "$directory" && ! -L "$directory" ]]; then
+            rm -rf -- "$directory" || return 1
+        fi
+    done
+    RUNTIME_WORK_DIR=$(mktemp -d "${RUNTIME_SOCKET}.requests.XXXXXXXX") || return 1
+    export RUNTIME_WORK_DIR
+    trap runtime_cleanup EXIT
+    # Finish the current operation before shutting down.
+    trap 'RUNTIME_STOP_REQUESTED=1' INT TERM
+    mkfifo -- "$RUNTIME_WORK_DIR/inbox" || return 1
+    exec {RUNTIME_INBOX_FD}<>"$RUNTIME_WORK_DIR/inbox"
+
+    (
+        # The listener retains the socket lock until its own cleanup finishes.
+        # This prevents an old listener unlinking a new daemon's socket.
+        exec {RUNTIME_LOCK_FD}>&- {RUNTIME_INBOX_FD}>&-
+        exec setpriv --pdeathsig TERM bash "$SCRIPT_DIR/runtimed" --listen
+    ) &
+    listener_pid=$!
+    printf 'Runtime daemon starting on %s\n' "$RUNTIME_SOCKET" >&2
+
+    while ((RUNTIME_STOP_REQUESTED == 0)); do
+        if IFS= read -r -t 1 directory <&"$RUNTIME_INBOX_FD"; then
+            runtime_process_directory "$directory"
+        fi
+        runtime_reap_children
+        if ! kill -0 "$listener_pid" 2>/dev/null; then
+            echo 'Runtime listener stopped unexpectedly.' >&2
+            return 1
+        fi
+    done
+}
+
+main "$@"

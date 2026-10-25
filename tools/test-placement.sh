@@ -30,7 +30,7 @@ ENV
             node_services
             expected=()
             [[ "$etcd" != true ]] || expected+=(etcdd)
-            [[ "$worker" != true ]] || expected+=(ipamd networkd kubelet)
+            [[ "$worker" != true ]] || expected+=(ipamd networkd runtimed kubelet)
             [[ "$scheduler" != true ]] || expected+=(scheduler)
             [[ "${SERVICES[*]}" == "${expected[*]}" ]]
         done

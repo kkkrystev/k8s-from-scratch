@@ -143,11 +143,11 @@ manual=''
 
     SNAPSHOT='{"env":{"RUN_ETCD":"false","RUN_WORKER":"true"}}'
     node_services
-    [[ "${SERVICES[*]}" == 'ipamd networkd kubelet' ]]
+    [[ "${SERVICES[*]}" == 'ipamd networkd runtimed kubelet' ]]
 
     SNAPSHOT='{"env":{"RUN_ETCD":"true","RUN_WORKER":"true"}}'
     node_services
-    [[ "${SERVICES[*]}" == 'etcdd ipamd networkd kubelet' ]]
+    [[ "${SERVICES[*]}" == 'etcdd ipamd networkd runtimed kubelet' ]]
 )
 
 # Use a fixed fixture so tests do not depend on the user's cluster topology.

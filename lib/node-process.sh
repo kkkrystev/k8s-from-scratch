@@ -47,7 +47,7 @@ node_services() {
     fi
 
     if [[ $(jq -r '.env.RUN_WORKER' <<< "$SNAPSHOT") == true ]]; then
-        SERVICES+=(ipamd networkd kubelet)
+        SERVICES+=(ipamd networkd runtimed kubelet)
     fi
 
     if [[ $(jq -r '.env.RUN_SCHEDULER' <<< "$SNAPSHOT") == true ]]; then
@@ -76,6 +76,9 @@ node_health() {
             ;;
         networkd)
             expr='source "$1/lib/network-client.sh"; network_health'
+            ;;
+        runtimed)
+            expr='source "$1/lib/runtime-client.sh"; runtime_health'
             ;;
         etcdd)
             # Test this local daemon, not some other server at ETCD_ENDPOINT.
@@ -119,6 +122,9 @@ node_service_locks_free() {
     local locks path
 
     case "$service" in
+        runtimed)
+            locks=$(jq -er '["/run/k8s-from-scratch/runtimed.lock", ((.env.RUNTIME_SOCKET // "/run/k8s-from-scratch/runtime.sock") + ".lock")] | .[]' <<< "$SNAPSHOT") || return 1
+            ;;
         scheduler)
             locks=/run/k8s-from-scratch/scheduler.lock
             ;;
@@ -152,7 +158,11 @@ node_service_locks_free() {
 
 node_stop_service() {
     local service="$1"
-    local pid='' deadline
+    local pid='' deadline stop_timeout=20
+
+    if [[ "$service" == runtimed ]]; then
+        stop_timeout=$(( $(jq -r '.env.RUNTIME_TIMEOUT // "60"' <<< "$SNAPSHOT") + 20 ))
+    fi
 
     if node_alive "$service"; then
         pid=$(node_pid "$service") || return 1
@@ -167,7 +177,7 @@ node_stop_service() {
         fi
     fi
 
-    deadline=$((SECONDS + 20))
+    deadline=$((SECONDS + stop_timeout))
 
     while node_alive "$service" || ! node_service_locks_free "$service"; do
         if ((SECONDS >= deadline)); then
@@ -207,8 +217,11 @@ node_unmanaged() {
         script=${script##*/}
         # Ignore handlers; daemon lifetime/locks handle them.
         [[ ${args[index + 1]:-} != --handle ]] || continue
+        if [[ "$script" == runtimed && ${args[index + 1]:-} == --listen ]]; then
+            continue
+        fi
         case "$script" in
-            ipamd | networkd | kubelet | etcdd | scheduler)
+            ipamd | networkd | runtimed | kubelet | etcdd | scheduler)
                 service="$script"
                 ;;
             *)
@@ -252,6 +265,10 @@ node_preflight() {
             networkd)
                 node_lock_free /run/k8s-from-scratch-network.lock || return 1
                 path=$(jq -r '.env.NETWORK_SOCKET + ".lock"' <<< "$SNAPSHOT")
+                ;;
+            runtimed)
+                node_lock_free /run/k8s-from-scratch/runtimed.lock || return 1
+                path=$(jq -r '.env.RUNTIME_SOCKET + ".lock"' <<< "$SNAPSHOT")
                 ;;
             scheduler)
                 path=/run/k8s-from-scratch/scheduler.lock
@@ -306,6 +323,13 @@ node_launch() {
             echo "Storage endpoint unavailable; $service was not started." >&2
             return 1
         }
+    fi
+
+    if [[ "$service" == kubelet ]]; then
+        "${ENV_ARGS[@]}" bash -c '
+            source "$1/lib/runtime-client.sh"
+            runtime_health
+        ' _ "$project" >/dev/null || return 1
     fi
 
     local command=(bash "$project/$service")
